@@ -25,6 +25,7 @@ use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::types::Value;
 use crate::File;
 use crate::IOExt;
 use crate::LimboError;
@@ -342,6 +343,13 @@ pub struct LogRecord {
     pub(crate) tx_timestamp: TxID,
     pub row_versions: Vec<RowVersion>,
     pub header: Option<DatabaseHeader>,
+    /// Sync-ready transaction payload stored alongside the MVCC recovery log.
+    ///
+    /// Recovery ignores this field. It is present so sync servers can stream
+    /// stable logical operations without reconstructing table/schema identity
+    /// from historical recovery records.
+    pub sync_payload: Vec<u8>,
+    pub sync_op_count: u32,
 }
 
 impl LogRecord {
@@ -350,8 +358,210 @@ impl LogRecord {
             tx_timestamp,
             row_versions: Vec::new(),
             header: None,
+            sync_payload: Vec::new(),
+            sync_op_count: 0,
         }
     }
+}
+
+const LOGICAL_OP_UPSERT_ROW: u64 = 0;
+const LOGICAL_OP_DELETE_ROW: u64 = 1;
+const LOGICAL_OP_SCHEMA: u64 = 2;
+const LOGICAL_OP_UPDATE_HEADER: u64 = 3;
+
+const LOGICAL_SCHEMA_CREATE: u64 = 0;
+const LOGICAL_SCHEMA_DROP: u64 = 1;
+const LOGICAL_SCHEMA_REFRESH: u64 = 2;
+
+const LOGICAL_SCHEMA_KIND_TABLE: u64 = 0;
+const LOGICAL_SCHEMA_KIND_INDEX: u64 = 1;
+const LOGICAL_SCHEMA_KIND_TRIGGER: u64 = 2;
+const LOGICAL_SCHEMA_KIND_VIEW: u64 = 3;
+
+const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
+const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+const TURSO_SYNC_TABLE_NAME: &str = "turso_sync_last_change_id";
+const TURSO_LEGACY_SYNC_TABLE_NAME: &str = "turso_sync";
+const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
+const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
+
+// Minimal protobuf encoder for the server/client `LogicalTxnData` wire shape.
+// Keeping this local avoids making turso_core depend on the sync engine or
+// server proto crate while still writing bytes that those layers can decode.
+fn write_proto_varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_proto_key(field: u64, wire_type: u64, out: &mut Vec<u8>) {
+    write_proto_varint((field << 3) | wire_type, out);
+}
+
+fn write_proto_uint64(field: u64, value: u64, out: &mut Vec<u8>) {
+    write_proto_key(field, 0, out);
+    write_proto_varint(value, out);
+}
+
+fn write_proto_sint64(field: u64, value: i64, out: &mut Vec<u8>) {
+    let zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    write_proto_uint64(field, zigzag, out);
+}
+
+fn write_proto_bytes(field: u64, value: &[u8], out: &mut Vec<u8>) {
+    write_proto_key(field, 2, out);
+    write_proto_varint(value.len() as u64, out);
+    out.extend_from_slice(value);
+}
+
+fn write_proto_string(field: u64, value: &str, out: &mut Vec<u8>) {
+    write_proto_bytes(field, value.as_bytes(), out);
+}
+
+fn append_logical_op(op_body: Vec<u8>, out: &mut Vec<u8>) {
+    write_proto_key(3, 2, out);
+    write_proto_varint(op_body.len() as u64, out);
+    out.extend_from_slice(&op_body);
+}
+
+fn is_synced_logical_name(name: &str) -> bool {
+    !name.starts_with(SQLITE_INTERNAL_PREFIX)
+        && !name.starts_with(TURSO_INTERNAL_PREFIX)
+        && name != TURSO_SYNC_TABLE_NAME
+        && name != TURSO_LEGACY_SYNC_TABLE_NAME
+        && name != TURSO_CDC_TABLE_NAME
+        && name != TURSO_CDC_VERSION_TABLE_NAME
+}
+
+/// Decoded subset of a `sqlite_schema` record needed to materialize stable
+/// sync schema operations at MVCC commit time.
+#[derive(Clone, Debug)]
+struct SyncSchemaRow {
+    row_type: String,
+    name: String,
+    rootpage: i64,
+    sql: Option<String>,
+}
+
+fn sync_schema_row_from_record(record_bytes: &[u8]) -> Result<SyncSchemaRow> {
+    let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
+    if values.len() < 5 {
+        return Err(LimboError::Corrupt(format!(
+            "sqlite_schema record must have at least 5 columns, got {}",
+            values.len()
+        )));
+    }
+    let text = |value: &Value, field: &str| -> Result<String> {
+        match value {
+            Value::Text(text) => Ok(text.as_str().to_string()),
+            other => Err(LimboError::Corrupt(format!(
+                "{field} must be text in sqlite_schema record, got {other:?}"
+            ))),
+        }
+    };
+    let optional_text = |value: &Value, field: &str| -> Result<Option<String>> {
+        match value {
+            Value::Text(text) => Ok(Some(text.as_str().to_string())),
+            Value::Null => Ok(None),
+            other => Err(LimboError::Corrupt(format!(
+                "{field} must be text or null in sqlite_schema record, got {other:?}"
+            ))),
+        }
+    };
+    let integer = |value: &Value, field: &str| -> Result<i64> {
+        match value {
+            Value::Numeric(Numeric::Integer(value)) => Ok(*value),
+            other => Err(LimboError::Corrupt(format!(
+                "{field} must be integer in sqlite_schema record, got {other:?}"
+            ))),
+        }
+    };
+    Ok(SyncSchemaRow {
+        row_type: text(&values[0], "sqlite_schema.type")?,
+        name: text(&values[1], "sqlite_schema.name")?,
+        rootpage: integer(&values[3], "sqlite_schema.rootpage")?,
+        sql: optional_text(&values[4], "sqlite_schema.sql")?,
+    })
+}
+
+fn sync_origin_client_id_from_record(record_bytes: &[u8]) -> Result<Option<String>> {
+    let values = ImmutableRecord::from_bin_record(record_bytes.to_vec()).get_values_owned()?;
+    let Some(Value::Text(client_id)) = values.first() else {
+        return Ok(None);
+    };
+    Ok(Some(client_id.as_str().to_string()))
+}
+
+fn sync_schema_kind(row_type: &str) -> Option<u64> {
+    if row_type.eq_ignore_ascii_case("table") {
+        Some(LOGICAL_SCHEMA_KIND_TABLE)
+    } else if row_type.eq_ignore_ascii_case("index") {
+        Some(LOGICAL_SCHEMA_KIND_INDEX)
+    } else if row_type.eq_ignore_ascii_case("trigger") {
+        Some(LOGICAL_SCHEMA_KIND_TRIGGER)
+    } else if row_type.eq_ignore_ascii_case("view") {
+        Some(LOGICAL_SCHEMA_KIND_VIEW)
+    } else {
+        None
+    }
+}
+
+fn sync_table_id_from_rootpage(rootpage: i64) -> MVTableId {
+    if rootpage > 0 {
+        MVTableId::from(-rootpage)
+    } else {
+        MVTableId::from(rootpage)
+    }
+}
+
+fn encode_schema_logical_op(action: u64, row: &SyncSchemaRow, out: &mut Vec<u8>) {
+    let Some(kind) = sync_schema_kind(&row.row_type) else {
+        return;
+    };
+    if !is_synced_logical_name(&row.name) {
+        return;
+    }
+    let mut op = Vec::new();
+    write_proto_uint64(1, LOGICAL_OP_SCHEMA, &mut op);
+    if matches!(action, LOGICAL_SCHEMA_CREATE | LOGICAL_SCHEMA_REFRESH) {
+        if let Some(sql) = row.sql.as_deref() {
+            write_proto_string(5, sql, &mut op);
+        }
+    }
+    write_proto_uint64(8, action, &mut op);
+    write_proto_uint64(9, kind, &mut op);
+    write_proto_string(10, &row.name, &mut op);
+    append_logical_op(op, out);
+}
+
+fn encode_row_logical_op(
+    op_type: u64,
+    table_name: &str,
+    rowid: i64,
+    record: &[u8],
+    out: &mut Vec<u8>,
+) {
+    if !is_synced_logical_name(table_name) {
+        return;
+    }
+    let mut op = Vec::new();
+    write_proto_uint64(1, op_type, &mut op);
+    write_proto_string(2, table_name, &mut op);
+    write_proto_sint64(3, rowid, &mut op);
+    if op_type == LOGICAL_OP_UPSERT_ROW {
+        write_proto_bytes(4, record, &mut op);
+    }
+    append_logical_op(op, out);
+}
+
+fn encode_header_logical_op(header: &DatabaseHeader, out: &mut Vec<u8>) {
+    let mut op = Vec::new();
+    write_proto_uint64(1, LOGICAL_OP_UPDATE_HEADER, &mut op);
+    write_proto_uint64(6, header.user_version.get() as u64, &mut op);
+    write_proto_uint64(7, header.application_id.get() as u64, &mut op);
+    append_logical_op(op, out);
 }
 
 /// A transaction timestamp or ID.
@@ -1620,7 +1830,6 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             ctx.cursor += 1;
             iterations += 1;
         }
-
         if ctx.cursor < write_set_len {
             // More work remains in the current pass: yield and resume.
             return Ok(TransitionResult::Io(IOCompletions::Single(
@@ -1638,7 +1847,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         // Both passes complete. Move the assembled log record out and
         // transition to BeginCommitLogicalLog (or directly to CommitEnd
         // if there is nothing to log).
-        let log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
+        let mut log_record = std::mem::replace(&mut ctx.log_record, LogRecord::new(end_ts));
+        self.populate_sync_payload(mvcc_store, &mut log_record);
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
         if log_record.row_versions.is_empty() && log_record.header.is_none() {
@@ -1656,6 +1866,181 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         }
         inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
         Ok(TransitionResult::Continue)
+    }
+
+    fn populate_sync_payload(&self, mvcc_store: &Arc<MvStore<Clock>>, log_record: &mut LogRecord) {
+        // The sync payload is the durable, replay-ready representation of this
+        // commit. Build it while the committing connection still has the exact
+        // schema context that produced the recovery log record; the server will
+        // later copy these bytes instead of reconstructing historical schema.
+        let mut table_names_by_id = HashMap::default();
+        {
+            let schema = self.connection.schema.read();
+            for (name, table) in schema.tables.iter() {
+                let Ok(rootpage) = table.get_root_page() else {
+                    continue;
+                };
+                if rootpage > 0 {
+                    table_names_by_id.insert(MVTableId::from(-rootpage), name.clone());
+                } else if rootpage < 0 {
+                    table_names_by_id.insert(MVTableId::from(rootpage), name.clone());
+                }
+            }
+        }
+
+        let mut encoded_ops = Vec::new();
+        let mut op_count = 0u32;
+        let mut origin_client_id = None;
+
+        if let Some(header) = log_record.header.as_ref() {
+            encode_header_logical_op(header, &mut encoded_ops);
+            op_count = op_count.saturating_add(1);
+        }
+
+        let mut schema_upserts = HashMap::default();
+        let mut schema_deletes = HashMap::default();
+        let mut schema_rowids = Vec::new();
+        for version in &log_record.row_versions {
+            if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                continue;
+            }
+            let rowid = version.row.id.row_id.to_int_or_panic();
+            if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                if let Ok(row) = sync_schema_row_from_record(version.row.payload()) {
+                    schema_rowids.push(rowid);
+                    schema_upserts.insert(rowid, row);
+                }
+            }
+            if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                if let Ok(row) = sync_schema_row_from_record(version.row.payload()) {
+                    schema_rowids.push(rowid);
+                    schema_deletes.insert(rowid, row);
+                } else {
+                    tracing::debug!(
+                        "unable to encode sqlite_schema delete for sync payload: rowid={rowid}"
+                    );
+                }
+            }
+        }
+
+        schema_rowids.sort_unstable();
+        schema_rowids.dedup();
+        for rowid in schema_rowids {
+            let old_row = schema_deletes.get(&rowid);
+            let new_row = schema_upserts.get(&rowid);
+            match (old_row, new_row) {
+                (Some(old_row), Some(new_row)) => {
+                    if old_row.rootpage != 0 {
+                        let table_id = sync_table_id_from_rootpage(old_row.rootpage);
+                        table_names_by_id.remove(&table_id);
+                    }
+                    if new_row.rootpage != 0 {
+                        let table_id = sync_table_id_from_rootpage(new_row.rootpage);
+                        table_names_by_id.insert(table_id, new_row.name.clone());
+                    }
+                    let before = encoded_ops.len();
+                    encode_schema_logical_op(LOGICAL_SCHEMA_REFRESH, new_row, &mut encoded_ops);
+                    if encoded_ops.len() != before {
+                        op_count = op_count.saturating_add(1);
+                    }
+                }
+                (None, Some(new_row)) => {
+                    if new_row.rootpage != 0 {
+                        let table_id = sync_table_id_from_rootpage(new_row.rootpage);
+                        table_names_by_id.insert(table_id, new_row.name.clone());
+                    }
+                    let before = encoded_ops.len();
+                    encode_schema_logical_op(LOGICAL_SCHEMA_CREATE, new_row, &mut encoded_ops);
+                    if encoded_ops.len() != before {
+                        op_count = op_count.saturating_add(1);
+                    }
+                }
+                (Some(old_row), None) => {
+                    let before = encoded_ops.len();
+                    encode_schema_logical_op(LOGICAL_SCHEMA_DROP, old_row, &mut encoded_ops);
+                    if encoded_ops.len() != before {
+                        op_count = op_count.saturating_add(1);
+                    }
+                    if old_row.rootpage != 0 {
+                        let table_id = sync_table_id_from_rootpage(old_row.rootpage);
+                        table_names_by_id.remove(&table_id);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        for entry in mvcc_store.table_id_to_rootpage.iter() {
+            let table_id = *entry.key();
+            let Some(rootpage) = *entry.value() else {
+                continue;
+            };
+            let root_table_id = MVTableId::from(-(rootpage as i64));
+            if let Some(name) = table_names_by_id.get(&root_table_id).cloned() {
+                table_names_by_id.insert(table_id, name);
+            }
+        }
+
+        for version in &log_record.row_versions {
+            let table_id = version.row.id.table_id;
+            if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+                continue;
+            }
+            if matches!(version.row.id.row_id, RowKey::Record(_)) {
+                continue;
+            }
+            let Some(table_name) = table_names_by_id.get(&table_id) else {
+                tracing::debug!("unable to encode MVCC row sync payload: table_id={table_id}");
+                continue;
+            };
+            let rowid = version.row.id.row_id.to_int_or_panic();
+            if version.begin == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                if table_name == TURSO_SYNC_TABLE_NAME {
+                    match sync_origin_client_id_from_record(version.row.payload()) {
+                        Ok(Some(client_id)) => origin_client_id = Some(client_id),
+                        Ok(None) => {}
+                        Err(err) => tracing::debug!(
+                            "unable to decode sync origin client_id from sync metadata row: {err}"
+                        ),
+                    }
+                }
+                let before = encoded_ops.len();
+                encode_row_logical_op(
+                    LOGICAL_OP_UPSERT_ROW,
+                    table_name,
+                    rowid,
+                    version.row.payload(),
+                    &mut encoded_ops,
+                );
+                if encoded_ops.len() != before {
+                    op_count = op_count.saturating_add(1);
+                }
+            }
+            if version.end == Some(TxTimestampOrID::Timestamp(log_record.tx_timestamp)) {
+                let before = encoded_ops.len();
+                encode_row_logical_op(
+                    LOGICAL_OP_DELETE_ROW,
+                    table_name,
+                    rowid,
+                    &[],
+                    &mut encoded_ops,
+                );
+                if encoded_ops.len() != before {
+                    op_count = op_count.saturating_add(1);
+                }
+            }
+        }
+
+        if let Some(client_id) = origin_client_id {
+            let mut txn_fields = Vec::new();
+            // LogicalTxnData.origin_client_id, field 4.
+            write_proto_string(4, &client_id, &mut txn_fields);
+            txn_fields.extend_from_slice(&encoded_ops);
+            encoded_ops = txn_fields;
+        }
+
+        log_record.sync_payload = encoded_ops;
+        log_record.sync_op_count = op_count;
     }
 
     /// Run one chunked step of `RewriteLiveVersions`. Processes up to
@@ -2684,6 +3069,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if minimum <= self.next_table_id.load(Ordering::SeqCst) {
             self.next_table_id.store(minimum - 1, Ordering::SeqCst);
         }
+    }
+
+    pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
+        self.table_id_to_rootpage.remove(table_id);
+        self.table_id_to_last_rowid.write().remove(table_id);
     }
 
     /// Acquire MVCC's stop-the-world gate for VACUUM.
@@ -4827,6 +5217,36 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.storage.get_logical_log_file()
     }
 
+    pub fn logical_log_offset(&self) -> u64 {
+        self.storage.logical_log_offset()
+    }
+
+    /// Replace the logical log with a fresh valid header after the database
+    /// file was restored outside MVCC.
+    ///
+    /// The returned completion must finish before reopening/recovering MVCC
+    /// state. Otherwise recovery could replay stale local logical-log frames on
+    /// top of the restored database image.
+    pub fn reset_logical_log_after_external_restore(&self) -> Result<Completion> {
+        self.storage.reset_to_fresh_header()
+    }
+
+    /// Return the durable sync completion for the freshly reset logical log.
+    ///
+    /// This is separate from `reset_logical_log_after_external_restore` so
+    /// callers can drive the reset completion cooperatively, then issue the
+    /// ordered sync only after the header/truncate group has completed.
+    pub fn sync_logical_log_after_external_restore(
+        &self,
+        connection: &Arc<Connection>,
+    ) -> Result<Option<Completion>> {
+        if connection.get_sync_mode() != SyncMode::Off {
+            let pager = connection.pager.load().clone();
+            return Ok(Some(self.storage.sync(pager.get_sync_type())?));
+        }
+        Ok(None)
+    }
+
     fn logical_log_header_crc_valid(&self, pager: &Arc<Pager>) -> Result<bool> {
         let file = self.get_logical_log_file();
         // Header is never encrypted; no need to pass EncryptionContext here.
@@ -5002,6 +5422,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let mut max_commit_ts_seen = persistent_tx_ts_max;
         let replay_cutoff_ts = persistent_tx_ts_max;
         let mut schema_rows: HashMap<i64, ImmutableRecord> = HashMap::default();
+        let mut schema_row_sources: HashMap<i64, &'static str> = HashMap::default();
         let mut dropped_root_pages: HashSet<i64> = HashSet::default();
         if let Some(mut stmt) = connection
             .query("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema")?
@@ -5012,6 +5433,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .map(|i| row.get_value(i).clone())
                     .collect::<Vec<_>>();
                 schema_rows.insert(rowid, ImmutableRecord::from_values(&values, values.len()));
+                schema_row_sources.insert(rowid, "checkpointed database");
                 Ok(())
             })?;
         }
@@ -5024,116 +5446,164 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // an inconsistent state and panic in populate_indices().
         // Cell is used so the get_index_info closure can flush the pending rebuild.
         let needs_schema_rebuild = std::cell::Cell::new(false);
+        let did_lenient_schema_rebuild = std::cell::Cell::new(false);
+        let skipped_recovered_index_ids = std::cell::RefCell::new(HashSet::default());
+        const SKIP_RECOVERED_INDEX_ROW: &str = "skip recovered index row for missing index schema";
 
-        let rebuild_schema =
-            |connection: &Arc<Connection>, schema_rows: &HashMap<i64, ImmutableRecord>| {
-                let pager = connection.pager.load().clone();
-                let cookie = self
-                    .global_header
-                    .read()
-                    .as_ref()
-                    .map(|header| header.schema_cookie.get())
-                    .unwrap_or(
-                        pager
-                            .io
-                            .block(|| pager.with_header(|header| header.schema_cookie))?
-                            .get(),
-                    );
-                let mut fresh = Schema::new();
-                fresh.generated_columns_enabled =
-                    connection.db.experimental_generated_columns_enabled();
-                fresh.schema_version = cookie;
-                let mut from_sql_indexes = Vec::with_capacity(10);
-                let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
-                let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-                let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-                let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-                let syms = connection.syms.read();
-                let mv_store = connection.db.get_mv_store().clone();
-
-                let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
-                sorted_rowids.sort_unstable();
-                for rowid in &sorted_rowids {
-                    let record = &schema_rows[rowid];
-                    let ty = match record.get_value_opt(0) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema type must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let name = match record.get_value_opt(1) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema name must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let table_name = match record.get_value_opt(2) {
-                        Some(ValueRef::Text(v)) => v.as_str(),
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema tbl_name must be text".to_string(),
-                            ))
-                        }
-                    };
-                    let root_page = match record.get_value_opt(3) {
-                        Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
-                        _ => {
-                            return Err(LimboError::Corrupt(
-                                "sqlite_schema root_page must be integer".to_string(),
-                            ))
-                        }
-                    };
-                    let sql = match record.get_value_opt(4) {
-                        Some(ValueRef::Text(v)) => Some(v.as_str()),
-                        _ => None,
-                    };
-                    let attached_resolver = |alias: &str| -> Option<usize> {
-                        connection
-                            .attached_databases()
-                            .read()
-                            .get_database_by_name(&crate::util::normalize_ident(alias))
-                            .map(|(idx, _)| idx)
-                    };
-                    fresh.handle_schema_row(
-                        ty,
-                        name,
-                        table_name,
-                        root_page,
-                        sql,
-                        &syms,
-                        &mut from_sql_indexes,
-                        &mut automatic_indices,
-                        &mut dbsp_state_roots,
-                        &mut dbsp_state_index_roots,
-                        &mut materialized_view_info,
-                        &attached_resolver,
-                    )?;
-                }
-                fresh.populate_indices(
-                    &syms,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                )?;
-                fresh.populate_materialized_views(
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                )?;
-                Self::rehydrate_table_valued_functions(
-                    &mut fresh,
-                    &preserved_table_valued_functions,
+        let rebuild_schema = |connection: &Arc<Connection>,
+                              schema_rows: &HashMap<i64, ImmutableRecord>,
+                              schema_row_sources: &HashMap<i64, &'static str>,
+                              strict_orphan_index_check: bool| {
+            let pager = connection.pager.load().clone();
+            let cookie = self
+                .global_header
+                .read()
+                .as_ref()
+                .map(|header| header.schema_cookie.get())
+                .unwrap_or(
+                    pager
+                        .io
+                        .block(|| pager.with_header(|header| header.schema_cookie))?
+                        .get(),
                 );
+            let mut fresh = Schema::new();
+            fresh.generated_columns_enabled =
+                connection.db.experimental_generated_columns_enabled();
+            fresh.schema_version = cookie;
+            let mut from_sql_indexes = Vec::with_capacity(10);
+            let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::default();
+            let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
+            let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
+            let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+            let syms = connection.syms.read();
+            let mv_store = connection.db.get_mv_store().clone();
 
-                let fresh = Arc::new(fresh);
-                *connection.schema.write() = fresh.clone();
-                *connection.db.schema.lock() = fresh;
-                Ok(())
-            };
+            let mut sorted_rowids: Vec<i64> = schema_rows.keys().copied().collect();
+            sorted_rowids.sort_unstable();
+            let mut table_names = HashSet::default();
+            for record in schema_rows.values() {
+                if let (Some(ValueRef::Text(row_type)), Some(ValueRef::Text(name))) =
+                    (record.get_value_opt(0), record.get_value_opt(1))
+                {
+                    if row_type.as_str() == "table" {
+                        table_names.insert(name.as_str().to_string());
+                    }
+                }
+            }
+
+            for rowid in &sorted_rowids {
+                let record = &schema_rows[rowid];
+                let ty = match record.get_value_opt(0) {
+                    Some(ValueRef::Text(v)) => v.as_str(),
+                    _ => {
+                        return Err(LimboError::Corrupt(
+                            "sqlite_schema type must be text".to_string(),
+                        ))
+                    }
+                };
+                let name = match record.get_value_opt(1) {
+                    Some(ValueRef::Text(v)) => v.as_str(),
+                    _ => {
+                        return Err(LimboError::Corrupt(
+                            "sqlite_schema name must be text".to_string(),
+                        ))
+                    }
+                };
+                let table_name = match record.get_value_opt(2) {
+                    Some(ValueRef::Text(v)) => v.as_str(),
+                    _ => {
+                        return Err(LimboError::Corrupt(
+                            "sqlite_schema tbl_name must be text".to_string(),
+                        ))
+                    }
+                };
+                let root_page = match record.get_value_opt(3) {
+                    Some(ValueRef::Numeric(Numeric::Integer(v))) => v,
+                    _ => {
+                        return Err(LimboError::Corrupt(
+                            "sqlite_schema root_page must be integer".to_string(),
+                        ))
+                    }
+                };
+                let sql = match record.get_value_opt(4) {
+                    Some(ValueRef::Text(v)) => Some(v.as_str()),
+                    _ => None,
+                };
+                if ty == "index" && sql.is_some() && !table_names.contains(table_name) {
+                    let source = schema_row_sources.get(rowid).copied().unwrap_or("unknown");
+                    if !strict_orphan_index_check {
+                        tracing::debug!(
+                            "skipping orphan index row during intermediate MVCC recovery schema rebuild: rowid={} source={} name={} tbl_name={} rootpage={}",
+                            rowid,
+                            source,
+                            name,
+                            table_name,
+                            root_page,
+                        );
+                        if root_page != 0 {
+                            let index_id = if root_page < 0 {
+                                Some(self.get_table_id_from_root_page(root_page))
+                            } else {
+                                self.table_id_to_rootpage
+                                    .iter()
+                                    .find(|entry| {
+                                        entry
+                                            .value()
+                                            .is_some_and(|value| value == root_page.unsigned_abs())
+                                    })
+                                    .map(|entry| *entry.key())
+                            };
+                            if let Some(index_id) = index_id {
+                                skipped_recovered_index_ids.borrow_mut().insert(index_id);
+                            }
+                        }
+                        continue;
+                    }
+                    return Err(LimboError::Corrupt(format!(
+                            "sqlite_schema contains index for missing table during MVCC recovery: rowid={rowid} source={source} name='{name}' tbl_name='{table_name}' rootpage={root_page} sql={}",
+                            sql.unwrap_or("")
+                        )));
+                }
+                let attached_resolver = |alias: &str| -> Option<usize> {
+                    connection
+                        .attached_databases()
+                        .read()
+                        .get_database_by_name(&crate::util::normalize_ident(alias))
+                        .map(|(idx, _)| idx)
+                };
+                fresh.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    root_page,
+                    sql,
+                    &syms,
+                    &mut from_sql_indexes,
+                    &mut automatic_indices,
+                    &mut dbsp_state_roots,
+                    &mut dbsp_state_index_roots,
+                    &mut materialized_view_info,
+                    &attached_resolver,
+                )?;
+            }
+            fresh.populate_indices(
+                &syms,
+                from_sql_indexes,
+                automatic_indices,
+                mv_store.is_some(),
+            )?;
+            fresh.populate_materialized_views(
+                materialized_view_info,
+                dbsp_state_roots,
+                dbsp_state_index_roots,
+            )?;
+            Self::rehydrate_table_valued_functions(&mut fresh, &preserved_table_valued_functions);
+
+            let fresh = Arc::new(fresh);
+            *connection.schema.write() = fresh.clone();
+            *connection.db.schema.lock() = fresh;
+            Ok(())
+        };
 
         loop {
             let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {
@@ -5142,7 +5612,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 } else {
                     // Flush any pending schema rebuild so we can see newly created indexes.
                     if needs_schema_rebuild.get() {
-                        rebuild_schema(&connection, &schema_rows)?;
+                        rebuild_schema(&connection, &schema_rows, &schema_row_sources, false)?;
+                        did_lenient_schema_rebuild.set(true);
                         index_infos.clear();
                         needs_schema_rebuild.set(false);
                     }
@@ -5160,16 +5631,26 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         .flatten()
                         .find(|idx| idx.root_page == root_page)
                         .ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "Index with root page {root_page} not found in schema",
-                            ))
+                            tracing::debug!(
+                                "skipping recovered index row for index without schema: index_id={} root_page={}",
+                                i64::from(index_id),
+                                root_page,
+                            );
+                            skipped_recovered_index_ids.borrow_mut().insert(index_id);
+                            LimboError::InternalError(SKIP_RECOVERED_INDEX_ROW.to_string())
                         })?;
                     let index_info = Arc::new(IndexInfo::new_from_index(index));
                     index_infos.insert(index_id, index_info.clone());
                     Ok(index_info)
                 }
             };
-            let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
+            let next_rec = match reader.next_record(&pager.io, &mut get_index_info) {
+                Ok(next_rec) => next_rec,
+                Err(LimboError::InternalError(message)) if message == SKIP_RECOVERED_INDEX_ROW => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
 
             tracing::trace!("next_rec {next_rec:?}");
 
@@ -5257,6 +5738,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                         let rowid_int = rowid.row_id.to_int_or_panic();
                         schema_rows.insert(rowid_int, record);
+                        schema_row_sources.insert(rowid_int, "logical log upsert");
                         needs_schema_rebuild.set(true);
                     } else if self.table_id_to_rootpage.get(&rowid.table_id).is_none() {
                         // Data row references a table_id not yet in the map. This can happen
@@ -5383,6 +5865,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             dropped_root_pages.insert(root_page);
                         }
                         schema_rows.remove(&rowid_int);
+                        schema_row_sources.remove(&rowid_int);
                         needs_schema_rebuild.set(true);
                     }
                 }
@@ -5467,8 +5950,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
         }
         // Flush any remaining pending schema rebuild after processing all log records.
-        if needs_schema_rebuild.get() {
-            rebuild_schema(&connection, &schema_rows)?;
+        // Intermediate rebuilds are lenient because a checkpointed database can
+        // contain a schema prefix that is repaired by the logical-log tail. The
+        // final rebuild is strict so permanent orphan schema rows still fail.
+        if needs_schema_rebuild.get() || did_lenient_schema_rebuild.get() {
+            rebuild_schema(&connection, &schema_rows, &schema_row_sources, true)?;
         }
 
         assert!(
