@@ -100,6 +100,7 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
+        conn.set_mvcc_sync_payload_enabled(true);
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -10345,6 +10346,22 @@ fn test_mvcc_sync_payload_encoder_matches_logical_op_wire_golden() {
 }
 
 #[test]
+fn test_mvcc_sync_payload_disabled_by_default() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:").unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO items VALUES (1, 'alpha')")
+        .unwrap();
+
+    let payload = collect_mvcc_sync_payload_bytes(&conn);
+
+    assert!(payload.is_empty());
+}
+
+#[test]
 fn test_mvcc_sync_payload_contains_user_schema_and_rows() {
     let db = MvccTestDb::new();
     db.conn
@@ -10552,10 +10569,12 @@ fn test_mvcc_sync_payload_emits_header_only_commits() {
 }
 
 #[test]
+#[cfg(feature = "conn_raw_api")]
 fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
         let conn = db.connect();
+        conn.set_mvcc_sync_payload_enabled(true);
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, payload TEXT)")
             .unwrap();
         conn.execute("INSERT INTO items VALUES (1, 'before')")
@@ -10567,6 +10586,7 @@ fn test_mvcc_sync_payload_uses_checkpointed_schema_after_restart() {
     db.restart();
     {
         let conn = db.connect();
+        conn.set_mvcc_sync_payload_enabled(true);
         conn.execute("INSERT INTO items VALUES (2, 'after')")
             .unwrap();
         conn.execute("ALTER TABLE items ADD COLUMN note TEXT")
