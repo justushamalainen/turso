@@ -2135,7 +2135,7 @@ impl BTreeCursor {
             self.index_info
                 .as_ref()
                 .expect("indexbtree_seek: index_info required"),
-        );
+        )?;
         if found {
             state.nearest_matching_cell.replace(cur_cell_idx as usize);
             match iter_dir {
@@ -2177,14 +2177,17 @@ impl BTreeCursor {
         seek_op: SeekOp,
         record_comparer: &RecordCompare,
         index_info: &IndexInfo,
-    ) -> (Ordering, bool) {
+    ) -> Result<(Ordering, bool)> {
         let record = self.get_immutable_record();
         let record = record.as_ref().unwrap();
 
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer
-            .compare(record, key_values, index_info, 0, tie_breaker)
-            .unwrap();
+        // Propagate corruption errors from the comparator (e.g. truncated
+        // variable-length payloads) instead of `.unwrap()`-panicking on
+        // them. The unwrap here used to abort the host process when a
+        // concurrently-written page produced a record whose declared
+        // string length did not match its encoded payload.
+        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
 
         let found = match seek_op {
             SeekOp::GT => cmp.is_gt(),
@@ -2194,7 +2197,7 @@ impl BTreeCursor {
             SeekOp::LE { eq_only: false } => cmp.is_le(),
             SeekOp::LT => cmp.is_lt(),
         };
-        (cmp, found)
+        Ok((cmp, found))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
