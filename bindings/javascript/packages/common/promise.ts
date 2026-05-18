@@ -180,6 +180,58 @@ class Database {
   }
 
   /**
+   * Executes a batch of SQL statements. When not already inside a transaction,
+   * the statements are wrapped in an implicit transaction and rolled back if
+   * any statement fails.
+   *
+   * @param statements - An array of SQL strings or `{ sql, args }` objects.
+   * @returns An object with `rowsAffected` (sum of affected rows) and
+   *   `lastInsertRowid` (rowid of the last successful insert).
+   */
+  async batch(statements: Array<string | { sql: string; args?: any[] | Record<string, any> }>): Promise<{ rowsAffected: number; lastInsertRowid: number | bigint | undefined }> {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected first argument to be an array of statements");
+    }
+
+    const wrap = !this._inTransaction;
+    if (wrap) {
+      await this.exec("BEGIN");
+      this._inTransaction = true;
+    }
+
+    let rowsAffected = 0;
+    let lastInsertRowid: number | bigint | undefined;
+    try {
+      for (const statement of statements) {
+        const sql = typeof statement === "string" ? statement : statement.sql;
+        const args = typeof statement === "string" ? undefined : statement.args;
+        const stmt = await this.prepare(sql);
+        try {
+          const info = args !== undefined ? await stmt.run(args) : await stmt.run();
+          rowsAffected += info.changes;
+          if (info.changes > 0) {
+            lastInsertRowid = info.lastInsertRowid;
+          }
+        } finally {
+          await stmt.close();
+        }
+      }
+      if (wrap) {
+        await this.exec("COMMIT");
+        this._inTransaction = false;
+      }
+    } catch (err) {
+      if (wrap) {
+        try { await this.exec("ROLLBACK"); } catch { /* ignore */ }
+        this._inTransaction = false;
+      }
+      throw err;
+    }
+
+    return { rowsAffected, lastInsertRowid };
+  }
+
+  /**
    * Prepares the SQL and executes it as `Statement.run`, returning the run info.
    *
    * @param {string} sql - The SQL statement string.

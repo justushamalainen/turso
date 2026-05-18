@@ -9,6 +9,11 @@ import { normalizeArgs, splitBindParameters } from './args.js';
  */
 export interface Config extends SessionConfig {}
 
+export type BatchStatement = string | {
+  sql: string;
+  args?: any[] | Record<string, any>;
+};
+
 
 /**
  * A connection to a Turso database.
@@ -251,7 +256,7 @@ export class Connection {
    * ]);
    * ```
    */
-  async batch(statements: string[], mode?: string, queryOptions?: QueryOptions): Promise<any> {
+  async batch(statements: BatchStatement[], mode?: string, queryOptions?: QueryOptions): Promise<any> {
     if (!this.isOpen) {
       throw new TypeError("The database connection is not open");
     }

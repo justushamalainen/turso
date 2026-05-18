@@ -102,6 +102,53 @@ test.serial("Database.exec() after close()", async (t) => {
 });
 
 // ==========================================================================
+// Database.batch()
+// ==========================================================================
+
+test.serial("Database.batch() with bound args", async (t) => {
+  const db = t.context.db;
+
+  const info = await db.batch([
+    { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Carol", "carol@example.net"] },
+    { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Dave", email: "dave@example.net" } },
+  ]);
+
+  t.is(info.rowsAffected, 2);
+  t.is(info.lastInsertRowid, 4);
+
+  const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4) ORDER BY id");
+  t.deepEqual(rows, [
+    { name: "Carol", email: "carol@example.net" },
+    { name: "Dave", email: "dave@example.net" },
+  ]);
+});
+
+test.serial("Database.transaction().deferred() with Database.batch()", async (t) => {
+  const db = t.context.db;
+
+  const insertMany = db.transaction(async () => {
+    t.is(db.inTransaction, true);
+    return await db.batch([
+      { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Joey", "joey@example.org"] },
+      { sql: "INSERT INTO users(name, email) VALUES (?, ?)", args: ["Sally", "sally@example.org"] },
+      { sql: "INSERT INTO users(name, email) VALUES (:name, :email)", args: { name: "Junior", email: "junior@example.org" } },
+    ]);
+  });
+
+  const info = await insertMany.deferred();
+  t.is(db.inTransaction, false);
+  t.is(info.rowsAffected, 3);
+  t.is(info.lastInsertRowid, 5);
+
+  const rows = await db.all("SELECT name, email FROM users WHERE id IN (3, 4, 5) ORDER BY id");
+  t.deepEqual(rows, [
+    { name: "Joey", email: "joey@example.org" },
+    { name: "Sally", email: "sally@example.org" },
+    { name: "Junior", email: "junior@example.org" },
+  ]);
+});
+
+// ==========================================================================
 // Database.prepare()
 // ==========================================================================
 

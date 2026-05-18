@@ -83,6 +83,36 @@ test.serial('batch() method executes multiple statements', async t => {
   t.is(queryResult.rows[0][0], 3);
 });
 
+test.serial('batch() accepts statement objects with bind args', async t => {
+  const localClient = connect({ url: 'http://fake-host' });
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, opts) => {
+    requests.push(JSON.parse(opts.body));
+    return new Response(
+      `${JSON.stringify({ baton: null, base_url: null })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n${JSON.stringify({ type: 'step_end', affected_row_count: 1 })}\n`,
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
+  };
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  await localClient.batch([
+    { sql: 'INSERT INTO users(name) VALUES(?)', args: ['alice'] },
+    { sql: 'INSERT INTO users(name) VALUES(:name)', args: { name: 'bob' } },
+  ]);
+
+  t.deepEqual(requests[0].batch.steps[0].stmt.args, [
+    { type: 'text', value: 'alice' },
+  ]);
+  t.deepEqual(requests[0].batch.steps[0].stmt.named_args, []);
+  t.deepEqual(requests[0].batch.steps[1].stmt.args, []);
+  t.deepEqual(requests[0].batch.steps[1].stmt.named_args, [
+    { name: 'name', value: { type: 'text', value: 'bob' } },
+  ]);
+});
+
 test.serial('execute() method queries a single value', async t => {
   const rs = await client.execute('SELECT 42');
   

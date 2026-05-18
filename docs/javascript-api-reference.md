@@ -48,6 +48,18 @@ Prepares a SQL statement for execution.
 
 The function returns a `Statement` object.
 
+#### batch(statements) ⇒ object
+
+Executes an array of SQL statements as a batch. Each statement is either a SQL string or an object of the form `{ sql, args }`, where `args` is an array of positional bind parameters or an object of named bind parameters.
+
+| Param      | Type                                                                                           | Description                               |
+| ---------- | ---------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| statements | <code>Array&lt;string \| { sql: string, args?: any[] \| Record&lt;string, any&gt; }&gt;</code> | The SQL statements to execute as a batch. |
+
+When the connection is not already inside a transaction, the batch is wrapped in an implicit transaction that is rolled back if any statement fails. When called from inside a `transaction(...)` callback, the surrounding transaction is reused.
+
+The function returns an object with two properties: `rowsAffected` (the total number of rows affected by all statements) and `lastInsertRowid` (the `rowid` of the last successful insert, or `undefined` if the batch performed no inserts).
+
 #### transaction(function) ⇒ function
 
 This function is currently not supported.
