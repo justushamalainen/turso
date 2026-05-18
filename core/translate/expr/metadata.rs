@@ -25,18 +25,30 @@ pub(super) fn translate_between_expr(
         unreachable!("translate_between_expr expects Expr::Between");
     };
 
-    let lhs_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+    // A row-value LHS (e.g. `(a,b,c) BETWEEN ... AND ...`) cannot be cached
+    // in a single register: translating `Parenthesized(exprs)` writes one
+    // register per component, so the scalar pre-translation below would
+    // under-allocate by `arity - 1` registers and trip the "insufficient
+    // registers allocated for expression vector write" guard. For row values
+    // we skip the cache and let the row-value binary comparison translator
+    // evaluate each component on its own when emitting the desugared
+    // `lhs >= start AND lhs <= end` pair.
+    let is_row_value_lhs =
+        matches!(unwrap_parens(lhs)?, ast::Expr::Parenthesized(exprs) if exprs.len() > 1);
 
     let mut between_resolver = resolver.fork_with_expr_cache();
-    between_resolver.enable_expr_to_reg_cache();
-    #[allow(clippy::or_fun_call)]
-    between_resolver.cache_scalar_expr_reg(
-        std::borrow::Cow::Owned(*lhs.to_owned()),
-        lhs_reg,
-        false,
-        referenced_tables.unwrap_or(&TableReferences::default()),
-    )?;
+    if !is_row_value_lhs {
+        let lhs_reg = program.alloc_register();
+        translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+        between_resolver.enable_expr_to_reg_cache();
+        #[allow(clippy::or_fun_call)]
+        between_resolver.cache_scalar_expr_reg(
+            std::borrow::Cow::Owned(*lhs.to_owned()),
+            lhs_reg,
+            false,
+            referenced_tables.unwrap_or(&TableReferences::default()),
+        )?;
+    }
 
     let (lower_expr, upper_expr, combine_op) = build_between_terms(
         std::mem::take(lhs),

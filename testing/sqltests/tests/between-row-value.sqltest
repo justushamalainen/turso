@@ -1,0 +1,65 @@
+@database :memory:
+
+# Regression test: tuple `BETWEEN` in expression position used to fail
+# preparation with "insufficient registers allocated for expression vector
+# write" because the BETWEEN translator allocated a single register for the
+# LHS and then translated the row-value into it, under-allocating by
+# `arity - 1`. The fix skips the scalar pre-translation/cache for row-value
+# LHS and lets the row-value binary comparison translator evaluate each
+# component on its own.
+
+@cross-check-integrity
+test between-row-value-literal-3-tuple-true {
+    SELECT (1, 2, 3) BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test between-row-value-literal-3-tuple-false {
+    SELECT (5, 5, 5) BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test between-row-value-literal-2-tuple {
+    SELECT (2, 2) BETWEEN (1, 2) AND (3, 4);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test not-between-row-value-literal {
+    SELECT (1, 2, 3) NOT BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test between-row-value-columns-in-result {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3), (2, 2, 2), (5, 5, 5);
+    SELECT (a, b, c) BETWEEN (1, 2, 3) AND (4, 5, 6) FROM t ORDER BY a;
+}
+expect {
+    1
+    1
+    0
+}
+
+@cross-check-integrity
+test between-row-value-in-order-by {
+    CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, 2, 3), (5, 5, 5), (2, 2, 2);
+    SELECT a FROM t2 ORDER BY ((a, b, c) BETWEEN (1, 2, 3) AND (4, 5, 6)) DESC, a;
+}
+expect {
+    1
+    2
+    5
+}
