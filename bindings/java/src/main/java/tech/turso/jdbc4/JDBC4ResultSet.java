@@ -70,7 +70,27 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (result == null) {
       return null;
     }
-    return wrapTypeConversion(() -> (String) result);
+    if (result instanceof String) {
+      return (String) result;
+    }
+    if (result instanceof byte[]) {
+      return bytesToHex((byte[]) result);
+    }
+    // INTEGER (Long/Integer) and REAL (Double/Float) coerce to TEXT via
+    // their natural string form, mirroring SQLite's CAST(... AS TEXT).
+    return result.toString();
+  }
+
+  private static final char[] HEX_DIGITS = "0123456789ABCDEF".toCharArray();
+
+  private static String bytesToHex(byte[] bytes) {
+    final char[] out = new char[bytes.length * 2];
+    for (int i = 0; i < bytes.length; i++) {
+      final int v = bytes[i] & 0xFF;
+      out[i * 2] = HEX_DIGITS[v >>> 4];
+      out[i * 2 + 1] = HEX_DIGITS[v & 0x0F];
+    }
+    return new String(out);
   }
 
   @Override

@@ -107,6 +107,42 @@ class JDBC4ResultSetTest {
   }
 
   @Test
+  void test_getString_coerces_integer_to_text() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_int_text (c);");
+    stmt.executeUpdate("INSERT INTO test_int_text VALUES (42);");
+    stmt.executeUpdate("INSERT INTO test_int_text VALUES (-2147483648);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_int_text");
+    assertTrue(resultSet.next());
+    assertEquals("42", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("-2147483648", resultSet.getString(1));
+  }
+
+  @Test
+  void test_getString_coerces_real_to_text() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_real_text (c);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (3.14);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_real_text");
+    assertTrue(resultSet.next());
+    assertEquals("3.14", resultSet.getString(1));
+  }
+
+  @Test
+  void test_getString_hex_encodes_blob() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_blob_text (c);");
+    stmt.executeUpdate("INSERT INTO test_blob_text VALUES (x'4142');");
+    stmt.executeUpdate("INSERT INTO test_blob_text VALUES (x'00FF');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_blob_text");
+    assertTrue(resultSet.next());
+    assertEquals("4142", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("00FF", resultSet.getString(1));
+  }
+
+  @Test
   void test_getBoolean_true() throws Exception {
     stmt.executeUpdate("CREATE TABLE test_boolean (boolean_col INTEGER);");
     stmt.executeUpdate("INSERT INTO test_boolean (boolean_col) VALUES (1);");
