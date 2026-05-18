@@ -1,0 +1,49 @@
+@database :memory:
+
+# Regression test: `PRAGMA temp.integrity_check` (and `PRAGMA temp.quick_check`)
+# used the main schema when generating the integrity-check program, so
+# `database_id == TEMP_DB_ID` ended up opening cursors on main's root pages
+# against the (empty) temp pager and failed with
+# `I/O error: short read on page N: expected 4096 bytes, got 0` as soon as
+# any main-schema table had been created.
+
+test temp-integrity-check-fresh {
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+}
+
+test temp-integrity-check-after-main-create-table {
+    CREATE TABLE t (x);
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+}
+
+test main-integrity-check-after-create-table {
+    CREATE TABLE t2 (x);
+    PRAGMA main.integrity_check;
+}
+expect {
+    ok
+}
+
+test temp-integrity-check-interleaved {
+    PRAGMA temp.integrity_check;
+    CREATE TABLE t3 (x);
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+    ok
+}
+
+test temp-quick-check-after-main-create-table {
+    CREATE TABLE t4 (x);
+    PRAGMA temp.quick_check;
+}
+expect {
+    ok
+}

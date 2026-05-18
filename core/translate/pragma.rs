@@ -1383,12 +1383,21 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, program, resolver, database_id, max_errors)?;
+            // `schema` is always the main schema. When the pragma targets a
+            // non-main database (e.g. `PRAGMA temp.integrity_check`) we must
+            // walk that database's own schema — otherwise we open cursors on
+            // main's root pages against the target pager and hit phantom
+            // short reads.
+            resolver.with_schema(database_id, |target_schema| {
+                translate_integrity_check(target_schema, program, resolver, database_id, max_errors)
+            })?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, program, resolver, database_id, max_errors)?;
+            resolver.with_schema(database_id, |target_schema| {
+                translate_quick_check(target_schema, program, resolver, database_id, max_errors)
+            })?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {
