@@ -104,12 +104,18 @@ impl DatabaseStorage for DatabaseFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
-        // casting to i64 to check some weird casting that could've happened before. This should be
-        // okay since page numbers should be u32
-        turso_assert_greater_than_or_equal!(page_idx as i64, 0);
+        // Page 0 is SQLite's locking page and is never a valid pager target.
+        // A caller passing 0 indicates upstream corruption (or an uninitialized
+        // page id); surface it as a recoverable error so the caller can fail
+        // its operation without taking down the whole process.
+        if page_idx == 0 {
+            return Err(LimboError::Corrupt(
+                "read_page called with page_idx=0 (likely uninitialized or corrupted page reference)"
+                    .to_string(),
+            ));
+        }
         let r = c.as_read();
         let size = r.buf().len();
-        turso_assert_greater_than!(page_idx, 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
@@ -407,5 +413,27 @@ mod tests {
             LimboError::CompletionError(CompletionError::Aborted)
         ));
         assert_eq!(original.get_error(), Some(CompletionError::Aborted));
+    }
+
+    /// Regression for bug "page_idx > 0 assertion fires on disk page read":
+    /// a caller passing page_idx=0 (SQLite's locking page, never a valid pager
+    /// target) used to trip `turso_assert_greater_than!(page_idx, 0)` and abort
+    /// the process. It now returns a recoverable `Corrupt` error.
+    #[test]
+    fn read_page_zero_returns_corrupt_error_not_panic() {
+        let db_file = DatabaseFile {
+            file: Arc::new(MockFile { read_result: Ok(0) }),
+        };
+        let io_ctx = IOContext::default();
+        let buf = Arc::new(Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_res| None);
+
+        let err = db_file
+            .read_page(0, &io_ctx, c)
+            .expect_err("read_page(0) must return Err, not panic");
+        assert!(
+            matches!(err, LimboError::Corrupt(_)),
+            "expected LimboError::Corrupt, got {err:?}"
+        );
     }
 }
