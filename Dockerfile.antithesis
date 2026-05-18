@@ -133,6 +133,7 @@ RUN pip install --break-system-packages /tmp/*.whl
 
 WORKDIR /app
 COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
+COPY ./testing/antithesis/savepoint-integrity-test/*.py /opt/antithesis/test/v1/savepoint-integrity-test/
 COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
 COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
 COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
