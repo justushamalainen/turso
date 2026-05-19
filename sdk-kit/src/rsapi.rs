@@ -701,12 +701,21 @@ impl TursoDatabase {
                         .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
 
+                    // Re-derive `open_flags` so the async open sees
+                    // `NoLock` under `multiprocess_wal`; the flags are
+                    // forwarded to the WAL-file open inside core, which
+                    // would otherwise take an fcntl lock and reject every
+                    // cross-process opener.
+                    let mut open_flags = OpenFlags::default();
+                    if opts.enable_multiprocess_wal {
+                        open_flags |= OpenFlags::NoLock;
+                    }
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
                         db_file,
-                        OpenFlags::default(),
+                        open_flags,
                         opts,
                         self.config.encryption.clone(),
                         None,
