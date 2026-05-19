@@ -25,6 +25,13 @@ cur = con.cursor()
 # No fixture rows are needed; the parallel drivers will themselves race
 # CREATE TABLE / INSERT / PRAGMA wal_checkpoint. We open the connection here
 # so the database file exists before the parallel drivers race for it.
-cur.execute("PRAGMA journal_mode = wal")
+#
+# NOTE: Turso's Python binding only actually steps a statement when its rows
+# are fetched. `PRAGMA journal_mode = wal` returns a row (the resulting mode),
+# so we must fetch it; otherwise the pragma is silently skipped and the
+# database stays in its default journal mode, defeating the whole scenario.
+result = cur.execute("PRAGMA journal_mode = wal")
+row = result.fetchone()
+print(f"journal_mode after setup: {row}")
 
 con.commit()

@@ -38,7 +38,13 @@ defs = ", ".join(f"c{i} INTEGER" for i in range(cols))
 try:
     cur.execute(f"CREATE TABLE IF NOT EXISTS {name} ({defs})")
     cur.execute(f"INSERT INTO {name} VALUES ({', '.join('0' for _ in range(cols))})")
-    cur.execute("PRAGMA wal_checkpoint")
+    # Turso's Python binding only steps a statement when its rows are fetched.
+    # `PRAGMA wal_checkpoint` returns (busy, log, checkpointed); without the
+    # fetch, the next `cur.execute("COMMIT")` finalizes the pragma before it
+    # runs, so the checkpoint-vs-writer interleaving this workload is meant
+    # to exercise never actually happens. Fetch the result to force execution.
+    result = cur.execute("PRAGMA wal_checkpoint")
+    result.fetchone()
     cur.execute("COMMIT")
 except Exception as e:
     try:
