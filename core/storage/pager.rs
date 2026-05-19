@@ -1087,6 +1087,45 @@ enum CheckpointPhase {
     Finalize { clear_page_cache: bool },
 }
 
+/// Pick the phase to enter after `WalFile::checkpoint` returns its
+/// [`CheckpointResult`].
+///
+/// INVARIANT: if `res.wal_checkpoint_backfilled > 0`, the returned phase chain
+/// MUST reach [`CheckpointPhase::PublishBackfill`] before reaching
+/// [`CheckpointPhase::Finalize`]. The only difference between the sync and
+/// non-sync paths is whether the durable backfill proof is fsynced *en route*
+/// to `PublishBackfill`. Skipping the durability dance must never skip
+/// publishing the progress — otherwise the next Passive checkpoint re-scans
+/// the WAL from frame 1 (see bug 10).
+fn phase_after_wal_checkpoint(
+    res: &super::wal::CheckpointResult,
+    mode: CheckpointMode,
+    sync_mode: crate::SyncMode,
+    clear_page_cache: bool,
+) -> CheckpointPhase {
+    if matches!(mode, CheckpointMode::Truncate { .. }) && res.should_truncate() {
+        return CheckpointPhase::TruncateDbFile {
+            sync_mode,
+            clear_page_cache,
+            page1_invalidated: false,
+        };
+    }
+    if res.wal_checkpoint_backfilled == 0 {
+        // Nothing to publish — nbackfills is unchanged.
+        return CheckpointPhase::Finalize { clear_page_cache };
+    }
+    // Backfill I/O happened. `nbackfills` MUST be advanced before reaching
+    // Finalize. The sync_mode just decides whether we ALSO write a durable
+    // proof en route.
+    match sync_mode {
+        crate::SyncMode::Off => CheckpointPhase::PublishBackfill {
+            clear_page_cache,
+            max_frame: res.wal_total_backfilled,
+        },
+        _ => CheckpointPhase::DurabilitySyncDbFile { clear_page_cache },
+    }
+}
+
 /// The mode of allocating a btree page.
 /// SQLite defines the following:
 /// #define BTALLOC_ANY   0           /* Allocate any page */
@@ -4196,40 +4235,8 @@ impl Pager {
                         }
                     });
                     let mut state = self.checkpoint_state.write();
-                    if matches!(mode, CheckpointMode::Truncate { .. })
-                        // `should_truncate` will be true for successful truncate checkpoint
-                        && res.should_truncate()
-                    {
-                        state.phase = CheckpointPhase::TruncateDbFile {
-                            sync_mode,
-                            clear_page_cache,
-                            page1_invalidated: false,
-                        };
-                    } else if res.wal_checkpoint_backfilled == 0 {
-                        // Nothing to publish — nbackfills is unchanged.
-                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
-                    } else if sync_mode == crate::SyncMode::Off {
-                        // synchronous=OFF: skip the durability dance (DB
-                        // fsync + durable-backfill-proof writeback) but STILL
-                        // publish the backfill progress. Otherwise nbackfills
-                        // never advances and every subsequent Passive
-                        // checkpoint re-scans the entire WAL from frame 1,
-                        // making cumulative bulk-insert cost O(N^2). See bug
-                        // 10 (`runs/turso-bugs/10-bulk-insert-throughput-vs-sqlite.md`).
-                        //
-                        // Crash safety is preserved by the proof-validation
-                        // on reopen at `wal.rs::build_shared_wal_from_tshm`
-                        // (search for `validate_backfill_proof`): without a
-                        // matching durable proof, a non-zero persisted
-                        // nbackfills is rejected and the WAL state rebuilt
-                        // from disk.
-                        state.phase = CheckpointPhase::PublishBackfill {
-                            clear_page_cache,
-                            max_frame: res.wal_total_backfilled,
-                        };
-                    } else {
-                        state.phase = CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
-                    }
+                    state.phase =
+                        phase_after_wal_checkpoint(&res, mode, sync_mode, clear_page_cache);
                     state.result = Some(res);
                 }
                 CheckpointPhase::TruncateDbFile {
