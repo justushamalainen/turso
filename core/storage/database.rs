@@ -415,10 +415,8 @@ mod tests {
         assert_eq!(original.get_error(), Some(CompletionError::Aborted));
     }
 
-    /// Regression for bug "page_idx > 0 assertion fires on disk page read":
-    /// a caller passing page_idx=0 (SQLite's locking page, never a valid pager
-    /// target) used to trip `turso_assert_greater_than!(page_idx, 0)` and abort
-    /// the process. It now returns a recoverable `Corrupt` error.
+    /// `page_idx=0` (SQLite's locking page) must surface as a recoverable
+    /// `Corrupt` error rather than panic the host process.
     #[test]
     fn read_page_zero_returns_corrupt_error_not_panic() {
         let db_file = DatabaseFile {
