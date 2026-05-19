@@ -1,12 +1,7 @@
 @database :memory:
 
-# Regression test: tuple `BETWEEN` in expression position used to fail
-# preparation with "insufficient registers allocated for expression vector
-# write" because the BETWEEN translator allocated a single register for the
-# LHS and then translated the row-value into it, under-allocating by
-# `arity - 1`. The fix skips the scalar pre-translation/cache for row-value
-# LHS and lets the row-value binary comparison translator evaluate each
-# component on its own.
+# Tuple `BETWEEN` in expression position: BETWEEN must allocate `arity`
+# registers for a row-value LHS and evaluate each component exactly once.
 
 @cross-check-integrity
 test between-row-value-literal-3-tuple-true {
