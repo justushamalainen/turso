@@ -1,11 +1,7 @@
 @database :memory:
 
-# Regression test: `PRAGMA temp.integrity_check` (and `PRAGMA temp.quick_check`)
-# used the main schema when generating the integrity-check program, so
-# `database_id == TEMP_DB_ID` ended up opening cursors on main's root pages
-# against the (empty) temp pager and failed with
-# `I/O error: short read on page N: expected 4096 bytes, got 0` as soon as
-# any main-schema table had been created.
+# `PRAGMA <db>.integrity_check` and `PRAGMA <db>.quick_check` must walk
+# the schema of the named database, not main's.
 
 test temp-integrity-check-fresh {
     PRAGMA temp.integrity_check;
