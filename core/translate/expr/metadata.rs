@@ -25,29 +25,67 @@ pub(super) fn translate_between_expr(
         unreachable!("translate_between_expr expects Expr::Between");
     };
 
-    // A row-value LHS (e.g. `(a,b,c) BETWEEN ... AND ...`) cannot be cached
-    // in a single register: translating `Parenthesized(exprs)` writes one
-    // register per component, so the scalar pre-translation below would
-    // under-allocate by `arity - 1` registers and trip the "insufficient
-    // registers allocated for expression vector write" guard. For row values
-    // we skip the cache and let the row-value binary comparison translator
-    // evaluate each component on its own when emitting the desugared
-    // `lhs >= start AND lhs <= end` pair.
-    let is_row_value_lhs =
-        matches!(unwrap_parens(lhs)?, ast::Expr::Parenthesized(exprs) if exprs.len() > 1);
+    // SQLite's BETWEEN evaluates the LHS exactly once, even though it desugars
+    // to `lhs >= start AND lhs <= end`. We preserve that semantic by
+    // translating the LHS up front and caching it; the desugared comparisons
+    // then reuse the cached register(s) via the resolver's expr-to-reg cache.
+    //
+    // For a row-value LHS (e.g. `(a,b,c) BETWEEN ... AND ...`) one register is
+    // not enough: each tuple component must live in its own register so the
+    // row-value binary comparison translator can compare them positionally.
+    // We pre-allocate `arity` consecutive registers, translate each component
+    // once into its slot, and cache each component individually so that when
+    // the desugared `Parenthesized(...) >= start` is translated, the
+    // Parenthesized handler's per-component `translate_expr` calls hit the
+    // cache and emit Copy instructions instead of re-evaluating volatile
+    // components like `random()`. Without per-component caching the row-value
+    // LHS would be evaluated twice, breaking BETWEEN's single-evaluation
+    // semantics.
+    let row_value_arity = match unwrap_parens(lhs)? {
+        ast::Expr::Parenthesized(exprs) if exprs.len() > 1 => Some(exprs.len()),
+        _ => None,
+    };
 
     let mut between_resolver = resolver.fork_with_expr_cache();
-    if !is_row_value_lhs {
-        let lhs_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
-        between_resolver.enable_expr_to_reg_cache();
-        #[allow(clippy::or_fun_call)]
-        between_resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(*lhs.to_owned()),
-            lhs_reg,
-            false,
-            referenced_tables.unwrap_or(&TableReferences::default()),
-        )?;
+    let default_tables = TableReferences::default();
+    let cache_tables = referenced_tables.unwrap_or(&default_tables);
+    match row_value_arity {
+        None => {
+            let lhs_reg = program.alloc_register();
+            translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+            between_resolver.enable_expr_to_reg_cache();
+            between_resolver.cache_scalar_expr_reg(
+                std::borrow::Cow::Owned(*lhs.to_owned()),
+                lhs_reg,
+                false,
+                cache_tables,
+            )?;
+        }
+        Some(arity) => {
+            // Pre-allocate the row-value vector registers and translate the
+            // full row value into them once. The Parenthesized handler writes
+            // exprs[i] into lhs_reg + i, so each component is evaluated
+            // exactly once.
+            let lhs_reg = program.alloc_registers(arity);
+            translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
+            between_resolver.enable_expr_to_reg_cache();
+            // Cache each component to its corresponding register. The cache
+            // key is the component expr node itself, which is the same node
+            // the downstream Parenthesized handler will pass to translate_expr
+            // when emitting `lhs >= start` / `lhs <= end`, so the cache lookup
+            // will hit and emit a Copy instead of re-evaluating the component.
+            let ast::Expr::Parenthesized(components) = unwrap_parens(lhs)? else {
+                unreachable!("row_value_arity is Some => Parenthesized");
+            };
+            for (i, component) in components.iter().enumerate() {
+                between_resolver.cache_scalar_expr_reg(
+                    std::borrow::Cow::Owned((**component).clone()),
+                    lhs_reg + i,
+                    false,
+                    cache_tables,
+                )?;
+            }
+        }
     }
 
     let (lower_expr, upper_expr, combine_op) = build_between_terms(
