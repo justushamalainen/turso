@@ -1,0 +1,84 @@
+@database :memory:
+
+# Tuple `BETWEEN` in expression position: BETWEEN must allocate `arity`
+# registers for a row-value LHS and evaluate each component exactly once.
+
+@cross-check-integrity
+test between-row-value-literal-3-tuple-true {
+    SELECT (1, 2, 3) BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test between-row-value-literal-3-tuple-false {
+    SELECT (5, 5, 5) BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test between-row-value-literal-2-tuple {
+    SELECT (2, 2) BETWEEN (1, 2) AND (3, 4);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test not-between-row-value-literal {
+    SELECT (1, 2, 3) NOT BETWEEN (1, 2, 3) AND (4, 5, 6);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test between-row-value-columns-in-result {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t VALUES (1, 2, 3), (2, 2, 2), (5, 5, 5);
+    SELECT (a, b, c) BETWEEN (1, 2, 3) AND (4, 5, 6) FROM t ORDER BY a;
+}
+expect {
+    1
+    1
+    0
+}
+
+@cross-check-integrity
+test between-row-value-in-order-by {
+    CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, 2, 3), (5, 5, 5), (2, 2, 2);
+    SELECT a FROM t2 ORDER BY ((a, b, c) BETWEEN (1, 2, 3) AND (4, 5, 6)) DESC, a;
+}
+expect {
+    1
+    2
+    5
+}
+
+# Regression: BETWEEN must evaluate its LHS exactly once, even when the LHS
+# is a row value. The desugaring `lhs >= start AND lhs <= end` would
+# otherwise clone a volatile LHS into both branches and evaluate it twice.
+# The trick: `(random(), 0) BETWEEN (0, 0) AND (0, 0)` is deterministically
+# 0 in SQLite (random() returning exactly 0 has probability ~2^-64). If the
+# LHS were re-evaluated, the two branches see independent random() values
+# and the comparison `(r1, 0) >= (0, 0) AND (r2, 0) <= (0, 0)` is true with
+# probability ~25%. To avoid CI flakiness we sum over 50 trials by joining
+# a 50-row table: with correct single-evaluation semantics SUM = 0, while
+# double-evaluation yields 0 only with probability ~(3/4)^50 ≈ 5.6e-7.
+@cross-check-integrity
+test between-row-value-lhs-evaluated-once {
+    CREATE TABLE trials (i INTEGER);
+    INSERT INTO trials VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10),
+                              (11), (12), (13), (14), (15), (16), (17), (18), (19), (20),
+                              (21), (22), (23), (24), (25), (26), (27), (28), (29), (30),
+                              (31), (32), (33), (34), (35), (36), (37), (38), (39), (40),
+                              (41), (42), (43), (44), (45), (46), (47), (48), (49), (50);
+    SELECT COUNT(*) FROM trials WHERE (random(), 0) BETWEEN (0, 0) AND (0, 0);
+}
+expect {
+    0
+}
