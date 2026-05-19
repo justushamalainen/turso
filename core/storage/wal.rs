@@ -5821,7 +5821,13 @@ pub mod test {
     }
 
     #[test]
-    fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
+    fn test_checkpoint_sync_mode_off_publishes_backfill_in_memory_without_durable_proof() {
+        // Without an in-memory publish, the next Passive checkpoint re-scans
+        // the WAL from frame 1 — per-row cost becomes super-linear in table
+        // size. The unsynced-publish case stays crash-safe because reopen in
+        // `build_shared_wal_from_tshm` rejects a non-zero persisted
+        // nbackfills without a matching durable proof
+        // (`validate_backfill_proof`).
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
         let conn = db.connect().unwrap();
@@ -5840,8 +5846,9 @@ pub mod test {
         );
         assert_eq!(
             wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
-            0,
-            "SyncMode::Off must not publish positive nbackfills as durable shared state"
+            result.wal_total_backfilled,
+            "SyncMode::Off must publish nbackfills in-memory so subsequent \
+             checkpoints don't re-scan the WAL from frame 1"
         );
     }
 

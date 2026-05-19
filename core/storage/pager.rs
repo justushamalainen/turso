@@ -1047,28 +1047,72 @@ enum CheckpointPhase {
         /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
         page1_invalidated: bool,
     },
-    /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
-    SyncDbFile { clear_page_cache: bool },
-    /// Read the synced database header before installing the durable backfill proof.
-    ReadDbIdentity {
+
+    /// Sync the database file. First phase of the optional durability
+    /// subchain (`DurabilitySyncDbFile` → `DurabilityReadDbIdentity` →
+    /// `DurabilityWriteProof`), skipped under `synchronous=OFF`. See
+    /// `phase_after_wal_checkpoint` for the invariant that publishing must
+    /// still happen even when this subchain is skipped.
+    DurabilitySyncDbFile { clear_page_cache: bool },
+    /// Read the synced database header before writing the durable backfill
+    /// proof. See `DurabilitySyncDbFile`.
+    DurabilityReadDbIdentity {
         clear_page_cache: bool,
         read: PendingCheckpointDbIdentityRead,
     },
-    /// Wait for backend-specific durable proof sync to finish before publishing nbackfills.
-    SyncBackfillProof {
+    /// Wait for backend-specific durable proof sync to finish before
+    /// publishing nbackfills. See `DurabilitySyncDbFile`.
+    DurabilityWriteProof {
         clear_page_cache: bool,
         max_frame: u64,
     },
-    /// Publish the durable backfill progress after the proof is installed and synced.
+    /// Publish the backfill progress so subsequent checkpoints start where
+    /// this one left off. Crash safety of the unsynced-publish case is
+    /// preserved by `validate_backfill_proof` on reopen (in
+    /// `wal.rs::build_shared_wal_from_tshm`).
     PublishBackfill {
         clear_page_cache: bool,
         max_frame: u64,
     },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
-    /// This must happen AFTER SyncDbFile to ensure data durability.
+    /// This must happen AFTER `DurabilitySyncDbFile` to ensure data durability.
     TruncateWalFile { clear_page_cache: bool },
     /// Finalize: release guard and optionally clear page cache.
     Finalize { clear_page_cache: bool },
+}
+
+/// Pick the phase to enter after `WalFile::checkpoint` returns its
+/// [`CheckpointResult`].
+///
+/// INVARIANT: if `res.wal_checkpoint_backfilled > 0`, the returned phase chain
+/// MUST reach [`CheckpointPhase::PublishBackfill`] before
+/// [`CheckpointPhase::Finalize`]. `sync_mode` decides only whether the
+/// durable backfill proof is fsynced en route — never whether progress is
+/// published. Skipping `PublishBackfill` leaves `nbackfills` frozen, so
+/// every following Passive checkpoint re-scans the WAL from frame 1.
+fn phase_after_wal_checkpoint(
+    res: &super::wal::CheckpointResult,
+    mode: CheckpointMode,
+    sync_mode: crate::SyncMode,
+    clear_page_cache: bool,
+) -> CheckpointPhase {
+    if matches!(mode, CheckpointMode::Truncate { .. }) && res.should_truncate() {
+        return CheckpointPhase::TruncateDbFile {
+            sync_mode,
+            clear_page_cache,
+            page1_invalidated: false,
+        };
+    }
+    if res.wal_checkpoint_backfilled == 0 {
+        return CheckpointPhase::Finalize { clear_page_cache };
+    }
+    match sync_mode {
+        crate::SyncMode::Off => CheckpointPhase::PublishBackfill {
+            clear_page_cache,
+            max_frame: res.wal_total_backfilled,
+        },
+        _ => CheckpointPhase::DurabilitySyncDbFile { clear_page_cache },
+    }
 }
 
 /// The mode of allocating a btree page.
@@ -4086,7 +4130,7 @@ impl Pager {
                 CheckpointMode::Restart | CheckpointMode::Truncate { .. }
             )
         {
-            return CheckpointPhase::ReadDbIdentity {
+            return CheckpointPhase::DurabilityReadDbIdentity {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
@@ -4180,22 +4224,8 @@ impl Pager {
                         }
                     });
                     let mut state = self.checkpoint_state.write();
-                    if matches!(mode, CheckpointMode::Truncate { .. })
-                        // `should_truncate` will be true for successful truncate checkpoint
-                        && res.should_truncate()
-                    {
-                        state.phase = CheckpointPhase::TruncateDbFile {
-                            sync_mode,
-                            clear_page_cache,
-                            page1_invalidated: false,
-                        };
-                    } else if res.wal_checkpoint_backfilled == 0
-                        || sync_mode == crate::SyncMode::Off
-                    {
-                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
-                    } else {
-                        state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                    }
+                    state.phase =
+                        phase_after_wal_checkpoint(&res, mode, sync_mode, clear_page_cache);
                     state.result = Some(res);
                 }
                 CheckpointPhase::TruncateDbFile {
@@ -4221,7 +4251,8 @@ impl Pager {
                             state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                            state.phase =
+                                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -4262,7 +4293,8 @@ impl Pager {
                             state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                            state.phase =
+                                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -4283,7 +4315,7 @@ impl Pager {
                         .db_truncate_sent = true;
                     io_yield_one!(c);
                 }
-                CheckpointPhase::SyncDbFile { clear_page_cache } => {
+                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache } => {
                     let need_sync_db_file = {
                         let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
@@ -4313,7 +4345,7 @@ impl Pager {
                         .db_sync_sent = true;
                     io_yield_one!(c);
                 }
-                CheckpointPhase::ReadDbIdentity {
+                CheckpointPhase::DurabilityReadDbIdentity {
                     clear_page_cache,
                     mut read,
                 } => {
@@ -4329,10 +4361,11 @@ impl Pager {
                             })
                         }))?;
                         read.read_sent = true;
-                        self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
-                            clear_page_cache,
-                            read,
-                        };
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::DurabilityReadDbIdentity {
+                                clear_page_cache,
+                                read,
+                            };
                         io_yield_one!(c);
                     }
 
@@ -4352,10 +4385,11 @@ impl Pager {
                         db_header_crc32c,
                         self.get_sync_type(),
                     )? {
-                        self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
-                            clear_page_cache,
-                            max_frame: read.max_frame,
-                        };
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::DurabilityWriteProof {
+                                clear_page_cache,
+                                max_frame: read.max_frame,
+                            };
                         io_yield_one!(c);
                     }
                     self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
@@ -4364,7 +4398,7 @@ impl Pager {
                     };
                     continue;
                 }
-                CheckpointPhase::SyncBackfillProof {
+                CheckpointPhase::DurabilityWriteProof {
                     clear_page_cache,
                     max_frame,
                 } => {
@@ -4420,6 +4454,9 @@ impl Pager {
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
+                    // Invariant entered here: `PublishBackfill` precedes
+                    // `Finalize` whenever backfill > 0; enforced by
+                    // `phase_after_wal_checkpoint`.
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
                     state.phase = CheckpointPhase::NotCheckpointing;
@@ -4463,8 +4500,10 @@ impl Pager {
             let Some(result) = state.result.as_ref() else {
                 continue;
             };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
+            if matches!(
+                state.phase,
+                CheckpointPhase::DurabilityReadDbIdentity { .. }
+            ) && result.db_sync_sent
                 && !self.syncing.load(Ordering::SeqCst)
             {
                 return Ok(result.wal_total_backfilled);
@@ -5814,8 +5853,10 @@ mod checkpoint_phase_tests {
             let Some(result) = state.result.as_ref() else {
                 continue;
             };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
+            if matches!(
+                state.phase,
+                CheckpointPhase::DurabilityReadDbIdentity { .. }
+            ) && result.db_sync_sent
                 && !pager.syncing.load(Ordering::SeqCst)
             {
                 break;
