@@ -5821,7 +5821,19 @@ pub mod test {
     }
 
     #[test]
-    fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
+    fn test_checkpoint_sync_mode_off_publishes_backfill_in_memory_without_durable_proof() {
+        // Regression for bug 10 (bulk-insert O(N^2) throughput cliff). When
+        // `synchronous=OFF`, the pager must still publish nbackfills after a
+        // checkpoint backfills frames into the DB file — otherwise the next
+        // Passive checkpoint re-scans the WAL from frame 1 forever and the
+        // per-row cost becomes super-linear in the table size.
+        //
+        // The publish-without-fsync path is safe because the reopen path in
+        // `build_shared_wal_from_tshm` (search for `validate_backfill_proof`)
+        // rejects a non-zero persisted nbackfills when no matching durable
+        // proof is found, and falls back to rebuilding WAL state from disk.
+        // So if a crash leaves shm.nbackfills positive but no proof on disk,
+        // the next opener correctly distrusts that state.
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
         let conn = db.connect().unwrap();
@@ -5840,8 +5852,9 @@ pub mod test {
         );
         assert_eq!(
             wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
-            0,
-            "SyncMode::Off must not publish positive nbackfills as durable shared state"
+            result.wal_total_backfilled,
+            "SyncMode::Off must publish nbackfills in-memory so subsequent \
+             checkpoints don't re-scan the WAL from frame 1 (bug 10)"
         );
     }
 

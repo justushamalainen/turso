@@ -4189,10 +4189,28 @@ impl Pager {
                             clear_page_cache,
                             page1_invalidated: false,
                         };
-                    } else if res.wal_checkpoint_backfilled == 0
-                        || sync_mode == crate::SyncMode::Off
-                    {
+                    } else if res.wal_checkpoint_backfilled == 0 {
+                        // Nothing to publish — nbackfills is unchanged.
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                    } else if sync_mode == crate::SyncMode::Off {
+                        // synchronous=OFF: skip the durability dance (DB
+                        // fsync + durable-backfill-proof writeback) but STILL
+                        // publish the backfill progress. Otherwise nbackfills
+                        // never advances and every subsequent Passive
+                        // checkpoint re-scans the entire WAL from frame 1,
+                        // making cumulative bulk-insert cost O(N^2). See bug
+                        // 10 (`runs/turso-bugs/10-bulk-insert-throughput-vs-sqlite.md`).
+                        //
+                        // Crash safety is preserved by the proof-validation
+                        // on reopen at `wal.rs::build_shared_wal_from_tshm`
+                        // (search for `validate_backfill_proof`): without a
+                        // matching durable proof, a non-zero persisted
+                        // nbackfills is rejected and the WAL state rebuilt
+                        // from disk.
+                        state.phase = CheckpointPhase::PublishBackfill {
+                            clear_page_cache,
+                            max_frame: res.wal_total_backfilled,
+                        };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
