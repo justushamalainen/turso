@@ -1048,28 +1048,27 @@ enum CheckpointPhase {
         page1_invalidated: bool,
     },
 
-    // --- Durability subchain (optional, gated by sync_mode != Off) ---------
-    //
-    // These three phases form an optional tail that fsyncs the DB file and
-    // writes a durable backfill proof. They are skipped when
-    // `synchronous=OFF`. Skipping them is purely a durability trade-off; it
-    // MUST NOT skip the subsequent `PublishBackfill` phase, otherwise
-    // `nbackfills` is never advanced and every following Passive checkpoint
-    // re-scans the WAL from frame 1 (bug 10).
-    //
-    /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
+    /// Sync the database file after checkpoint. First phase of the optional
+    /// durability subchain (`DurabilitySyncDbFile` → `DurabilityReadDbIdentity`
+    /// → `DurabilityWriteProof`) which is skipped under `synchronous=OFF`.
+    /// Skipping the subchain MUST NOT skip the subsequent `PublishBackfill`,
+    /// or `nbackfills` is never advanced and every following Passive
+    /// checkpoint re-scans the WAL from frame 1 (bug 10).
     DurabilitySyncDbFile { clear_page_cache: bool },
-    /// Read the synced database header before installing the durable backfill proof.
+    /// Read the synced database header before installing the durable backfill
+    /// proof. Part of the optional durability subchain (see
+    /// `DurabilitySyncDbFile`).
     DurabilityReadDbIdentity {
         clear_page_cache: bool,
         read: PendingCheckpointDbIdentityRead,
     },
-    /// Wait for backend-specific durable proof sync to finish before publishing nbackfills.
+    /// Wait for backend-specific durable proof sync to finish before
+    /// publishing nbackfills. Part of the optional durability subchain (see
+    /// `DurabilitySyncDbFile`).
     DurabilityWriteProof {
         clear_page_cache: bool,
         max_frame: u64,
     },
-    // --- End durability subchain ------------------------------------------
     /// Publish the backfill progress so subsequent checkpoints start where
     /// this one left off. MANDATORY whenever this checkpoint actually
     /// backfilled frames into the DB file (`wal_checkpoint_backfilled > 0`),
@@ -4465,6 +4464,14 @@ impl Pager {
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
+                    // INVARIANT (see `phase_after_wal_checkpoint`): if this
+                    // checkpoint backfilled any frames, the chain MUST have
+                    // gone through `PublishBackfill` before reaching
+                    // Finalize. Skipping that step (as the pre-bug-10 code
+                    // did for `synchronous=OFF`) leaves `nbackfills` frozen
+                    // and every subsequent Passive checkpoint re-scans the
+                    // WAL from frame 1. Future edits adding new short-circuits
+                    // must preserve this invariant.
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
                     state.phase = CheckpointPhase::NotCheckpointing;
