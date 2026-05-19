@@ -8,6 +8,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.sql.Array;
 import java.sql.Blob;
 import java.sql.Clob;
@@ -24,6 +25,7 @@ import java.sql.Statement;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.util.Calendar;
+import java.util.Locale;
 import java.util.Map;
 import tech.turso.annotations.Nullable;
 import tech.turso.annotations.SkipNullableCheck;
@@ -70,7 +72,118 @@ public final class JDBC4ResultSet implements ResultSet, ResultSetMetaData {
     if (result == null) {
       return null;
     }
-    return wrapTypeConversion(() -> (String) result);
+    if (result instanceof String) {
+      return (String) result;
+    }
+    if (result instanceof byte[]) {
+      // SQLite's CAST(blob AS TEXT) reinterprets the raw bytes as text in the
+      // database encoding (UTF-8 by default). Match that behavior; invalid
+      // UTF-8 sequences are replaced with U+FFFD (the JDK default), which is
+      // the same observable outcome xerial sqlite-jdbc produces via the JNI
+      // sqlite3_column_text path.
+      return new String((byte[]) result, StandardCharsets.UTF_8);
+    }
+    if (result instanceof Double) {
+      return realToText((Double) result);
+    }
+    if (result instanceof Float) {
+      return realToText(((Float) result).doubleValue());
+    }
+    // INTEGER (Long/Integer) and any remaining numeric types coerce to TEXT via
+    // their natural string form, matching SQLite's CAST(... AS TEXT).
+    return result.toString();
+  }
+
+  /**
+   * Formats a double the way SQLite (and Turso's engine) formats REAL values
+   * when coercing them to TEXT, i.e. {@code CAST(value AS TEXT)} and
+   * {@code printf("%g", value)} with 15 significant digits.
+   *
+   * <p>This mirrors {@code core::numeric::format_float}: it uses a fixed-point
+   * form when the decimal exponent is in {@code -4..=14} and a scientific
+   * form otherwise. The scientific form is {@code "<digits>.<digits>e<sign><exp>"},
+   * the exponent is at least two digits wide and always carries an explicit
+   * sign — so e.g. {@code 1e20} becomes {@code "1.0e+20"} and {@code 1e-7}
+   * becomes {@code "1.0e-07"}, both matching SQLite. Trailing zeros in the
+   * mantissa are stripped, but at least one digit always follows the decimal
+   * point (so {@code 123456789012345.0} stays as {@code "123456789012345.0"}
+   * rather than collapsing to {@code "123456789012345"}).
+   */
+  static String realToText(double v) {
+    if (Double.isNaN(v)) {
+      // Matches core::numeric::decompose_float: NaN renders as "".
+      return "";
+    }
+    if (Double.isInfinite(v)) {
+      return v > 0 ? "Inf" : "-Inf";
+    }
+    if (v == 0.0) {
+      // Covers both +0.0 and -0.0; SQLite renders both as "0.0".
+      return "0.0";
+    }
+
+    // Use Java's %.15g which produces 15 significant digits — same precision
+    // SQLite uses for CAST(real AS TEXT). The output is either fixed or
+    // scientific depending on magnitude.
+    String s = String.format(Locale.ROOT, "%.15g", v);
+
+    int ePos = s.indexOf('e');
+    if (ePos < 0) {
+      ePos = s.indexOf('E');
+    }
+
+    if (ePos >= 0) {
+      // Scientific form: trim trailing zeros from the mantissa, then normalize
+      // the exponent ("e+05" stays "e+05"; SQLite always emits an explicit
+      // sign and at least 2-digit exponent, which is also Java's default).
+      String mantissa = s.substring(0, ePos);
+      String exponent = s.substring(ePos + 1); // includes sign like "+20" or "-07"
+      mantissa = stripTrailingZeros(mantissa);
+      char sign;
+      String digits;
+      if (exponent.charAt(0) == '+' || exponent.charAt(0) == '-') {
+        sign = exponent.charAt(0);
+        digits = exponent.substring(1);
+      } else {
+        sign = '+';
+        digits = exponent;
+      }
+      // Strip leading zeros but keep at least two digits, matching SQLite.
+      int firstNonZero = 0;
+      while (firstNonZero < digits.length() - 1 && digits.charAt(firstNonZero) == '0') {
+        firstNonZero++;
+      }
+      digits = digits.substring(firstNonZero);
+      if (digits.length() < 2) {
+        digits = "0" + digits;
+      }
+      return mantissa + "e" + sign + digits;
+    }
+
+    // Fixed form: ensure the result has a decimal point with at least one digit
+    // after it (e.g. "100000000000000" -> "100000000000000.0"), then strip
+    // trailing zeros after the point while keeping at least one fractional digit.
+    if (s.indexOf('.') < 0) {
+      return s + ".0";
+    }
+    return stripTrailingZeros(s);
+  }
+
+  /**
+   * Strips trailing zeros from a fixed-point decimal string, leaving at least
+   * one digit after the decimal point. If the string has no decimal point it
+   * is returned unchanged.
+   */
+  private static String stripTrailingZeros(String s) {
+    int dot = s.indexOf('.');
+    if (dot < 0) {
+      return s;
+    }
+    int end = s.length();
+    while (end > dot + 2 && s.charAt(end - 1) == '0') {
+      end--;
+    }
+    return s.substring(0, end);
   }
 
   @Override

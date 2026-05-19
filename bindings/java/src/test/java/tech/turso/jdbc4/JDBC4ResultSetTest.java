@@ -107,6 +107,88 @@ class JDBC4ResultSetTest {
   }
 
   @Test
+  void test_getString_coerces_integer_to_text() throws Exception {
+    stmt.executeUpdate("CREATE TABLE test_int_text (c);");
+    stmt.executeUpdate("INSERT INTO test_int_text VALUES (42);");
+    stmt.executeUpdate("INSERT INTO test_int_text VALUES (-2147483648);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_int_text");
+    assertTrue(resultSet.next());
+    assertEquals("42", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("-2147483648", resultSet.getString(1));
+  }
+
+  @Test
+  void test_getString_coerces_real_to_text() throws Exception {
+    // Verify CAST(real AS TEXT) compatibility — values verified against SQLite.
+    stmt.executeUpdate("CREATE TABLE test_real_text (c);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (3.14);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (0.1);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (1e20);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (123456789012345.0);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (1e-7);");
+    stmt.executeUpdate("INSERT INTO test_real_text VALUES (-20228007.0);");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_real_text");
+    assertTrue(resultSet.next());
+    assertEquals("3.14", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("0.1", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("1.0e+20", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("123456789012345.0", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("1.0e-07", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("-20228007.0", resultSet.getString(1));
+  }
+
+  @Test
+  void test_getString_real_special_values() throws Exception {
+    // realToText is a static helper, so exercise it directly for special values
+    // we cannot easily store in a SQLite REAL column (NaN/Infinity).
+    assertEquals("", JDBC4ResultSet.realToText(Double.NaN));
+    assertEquals("Inf", JDBC4ResultSet.realToText(Double.POSITIVE_INFINITY));
+    assertEquals("-Inf", JDBC4ResultSet.realToText(Double.NEGATIVE_INFINITY));
+    assertEquals("0.0", JDBC4ResultSet.realToText(0.0));
+    assertEquals("0.0", JDBC4ResultSet.realToText(-0.0));
+  }
+
+  @Test
+  void test_getString_decodes_blob_as_utf8_text() throws Exception {
+    // Mirrors SQLite's CAST(x'...' AS TEXT), which reinterprets the bytes as
+    // text in the database encoding (UTF-8 by default).
+    stmt.executeUpdate("CREATE TABLE test_blob_text (c);");
+    stmt.executeUpdate("INSERT INTO test_blob_text VALUES (x'4142');"); // "AB"
+    stmt.executeUpdate("INSERT INTO test_blob_text VALUES (x'48656C6C6F');"); // "Hello"
+    // Multi-byte UTF-8: "héllo" (h c3 a9 l l o).
+    stmt.executeUpdate("INSERT INTO test_blob_text VALUES (x'68C3A96C6C6F');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_blob_text");
+    assertTrue(resultSet.next());
+    assertEquals("AB", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("Hello", resultSet.getString(1));
+    assertTrue(resultSet.next());
+    assertEquals("héllo", resultSet.getString(1));
+  }
+
+  @Test
+  void test_getString_blob_with_invalid_utf8_uses_replacement_char() throws Exception {
+    // 0xFF on its own is not a valid UTF-8 sequence. Java's default
+    // UTF-8 decoder substitutes U+FFFD ("�"), which matches the
+    // observable behavior of xerial sqlite-jdbc on the JNI side.
+    stmt.executeUpdate("CREATE TABLE test_blob_invalid (c);");
+    stmt.executeUpdate("INSERT INTO test_blob_invalid VALUES (x'00FF');");
+
+    ResultSet resultSet = stmt.executeQuery("SELECT * FROM test_blob_invalid");
+    assertTrue(resultSet.next());
+    assertEquals("\u0000\uFFFD", resultSet.getString(1));
+  }
+
+  @Test
   void test_getBoolean_true() throws Exception {
     stmt.executeUpdate("CREATE TABLE test_boolean (boolean_col INTEGER);");
     stmt.executeUpdate("INSERT INTO test_boolean (boolean_col) VALUES (1);");
