@@ -1047,25 +1047,41 @@ enum CheckpointPhase {
         /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
         page1_invalidated: bool,
     },
+
+    // --- Durability subchain (optional, gated by sync_mode != Off) ---------
+    //
+    // These three phases form an optional tail that fsyncs the DB file and
+    // writes a durable backfill proof. They are skipped when
+    // `synchronous=OFF`. Skipping them is purely a durability trade-off; it
+    // MUST NOT skip the subsequent `PublishBackfill` phase, otherwise
+    // `nbackfills` is never advanced and every following Passive checkpoint
+    // re-scans the WAL from frame 1 (bug 10).
+    //
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
-    SyncDbFile { clear_page_cache: bool },
+    DurabilitySyncDbFile { clear_page_cache: bool },
     /// Read the synced database header before installing the durable backfill proof.
-    ReadDbIdentity {
+    DurabilityReadDbIdentity {
         clear_page_cache: bool,
         read: PendingCheckpointDbIdentityRead,
     },
     /// Wait for backend-specific durable proof sync to finish before publishing nbackfills.
-    SyncBackfillProof {
+    DurabilityWriteProof {
         clear_page_cache: bool,
         max_frame: u64,
     },
-    /// Publish the durable backfill progress after the proof is installed and synced.
+    // --- End durability subchain ------------------------------------------
+    /// Publish the backfill progress so subsequent checkpoints start where
+    /// this one left off. MANDATORY whenever this checkpoint actually
+    /// backfilled frames into the DB file (`wal_checkpoint_backfilled > 0`),
+    /// regardless of `sync_mode`. Crash safety of the unsynced case is
+    /// preserved by the reopen path's `validate_backfill_proof` check (see
+    /// `wal.rs::build_shared_wal_from_tshm`).
     PublishBackfill {
         clear_page_cache: bool,
         max_frame: u64,
     },
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
-    /// This must happen AFTER SyncDbFile to ensure data durability.
+    /// This must happen AFTER `DurabilitySyncDbFile` to ensure data durability.
     TruncateWalFile { clear_page_cache: bool },
     /// Finalize: release guard and optionally clear page cache.
     Finalize { clear_page_cache: bool },
@@ -4086,7 +4102,7 @@ impl Pager {
                 CheckpointMode::Restart | CheckpointMode::Truncate { .. }
             )
         {
-            return CheckpointPhase::ReadDbIdentity {
+            return CheckpointPhase::DurabilityReadDbIdentity {
                 clear_page_cache,
                 read: PendingCheckpointDbIdentityRead {
                     max_frame: result.wal_total_backfilled,
@@ -4212,7 +4228,7 @@ impl Pager {
                             max_frame: res.wal_total_backfilled,
                         };
                     } else {
-                        state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                        state.phase = CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
                     }
                     state.result = Some(res);
                 }
@@ -4239,7 +4255,8 @@ impl Pager {
                             state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                            state.phase =
+                                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -4280,7 +4297,8 @@ impl Pager {
                             state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
                             // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                            state.phase =
+                                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache };
                         }
                         continue;
                     }
@@ -4301,7 +4319,7 @@ impl Pager {
                         .db_truncate_sent = true;
                     io_yield_one!(c);
                 }
-                CheckpointPhase::SyncDbFile { clear_page_cache } => {
+                CheckpointPhase::DurabilitySyncDbFile { clear_page_cache } => {
                     let need_sync_db_file = {
                         let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
@@ -4331,7 +4349,7 @@ impl Pager {
                         .db_sync_sent = true;
                     io_yield_one!(c);
                 }
-                CheckpointPhase::ReadDbIdentity {
+                CheckpointPhase::DurabilityReadDbIdentity {
                     clear_page_cache,
                     mut read,
                 } => {
@@ -4347,10 +4365,11 @@ impl Pager {
                             })
                         }))?;
                         read.read_sent = true;
-                        self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
-                            clear_page_cache,
-                            read,
-                        };
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::DurabilityReadDbIdentity {
+                                clear_page_cache,
+                                read,
+                            };
                         io_yield_one!(c);
                     }
 
@@ -4370,10 +4389,11 @@ impl Pager {
                         db_header_crc32c,
                         self.get_sync_type(),
                     )? {
-                        self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
-                            clear_page_cache,
-                            max_frame: read.max_frame,
-                        };
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::DurabilityWriteProof {
+                                clear_page_cache,
+                                max_frame: read.max_frame,
+                            };
                         io_yield_one!(c);
                     }
                     self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
@@ -4382,7 +4402,7 @@ impl Pager {
                     };
                     continue;
                 }
-                CheckpointPhase::SyncBackfillProof {
+                CheckpointPhase::DurabilityWriteProof {
                     clear_page_cache,
                     max_frame,
                 } => {
@@ -4481,8 +4501,10 @@ impl Pager {
             let Some(result) = state.result.as_ref() else {
                 continue;
             };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
+            if matches!(
+                state.phase,
+                CheckpointPhase::DurabilityReadDbIdentity { .. }
+            ) && result.db_sync_sent
                 && !self.syncing.load(Ordering::SeqCst)
             {
                 return Ok(result.wal_total_backfilled);
@@ -5832,8 +5854,10 @@ mod checkpoint_phase_tests {
             let Some(result) = state.result.as_ref() else {
                 continue;
             };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
+            if matches!(
+                state.phase,
+                CheckpointPhase::DurabilityReadDbIdentity { .. }
+            ) && result.db_sync_sent
                 && !pager.syncing.load(Ordering::SeqCst)
             {
                 break;
