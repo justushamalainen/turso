@@ -2182,11 +2182,8 @@ impl BTreeCursor {
         let record = record.as_ref().unwrap();
 
         let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        // Propagate corruption errors from the comparator (e.g. truncated
-        // variable-length payloads) instead of `.unwrap()`-panicking on
-        // them. The unwrap here used to abort the host process when a
-        // concurrently-written page produced a record whose declared
-        // string length did not match its encoded payload.
+        // Propagate `Corrupt` errors from the comparator (e.g. truncated
+        // variable-length payloads) rather than panicking on them.
         let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
 
         let found = match seek_op {
