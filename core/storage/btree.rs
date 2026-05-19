@@ -6443,17 +6443,24 @@ pub fn integrity_check(
         if first_freeblock > 0 {
             let mut pc = first_freeblock;
             while pc > 0 {
-                let next = contents.read_u16_no_offset(pc as usize) as usize;
-                let size = contents.read_u16_no_offset(pc as usize + 2) as usize;
-                // check it doesn't go out of range
-                if pc > usable_space - 4 {
+                // Bounds-check before reading the freeblock header. A
+                // corrupted page can encode a pointer past the page
+                // buffer (we have seen pc = 9986 on a 4 KiB page in the
+                // wild); reading two u16s blindly would panic via the
+                // slice bounds check and abort the host process.
+                // integrity_check is the diagnostic users run to *find*
+                // corruption, so we record it and stop walking the
+                // freelist instead of crashing on it.
+                if pc.saturating_add(4) > usable_space {
                     errors.push(IntegrityCheckError::FreeBlockOutOfRange {
                         page_id: page.get().id as i64,
                         start: pc,
-                        end: pc + size,
+                        end: pc,
                     });
                     break;
                 }
+                let next = contents.read_u16_no_offset(pc) as usize;
+                let size = contents.read_u16_no_offset(pc + 2) as usize;
                 coverage_checker.add_free_block(pc, pc + size);
                 pc = next;
             }
