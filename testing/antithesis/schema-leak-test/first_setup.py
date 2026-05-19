@@ -1,16 +1,8 @@
 #!/usr/bin/env -S python3 -u
 
-# Scenario: regression coverage for the concurrent CREATE TABLE page-leak bug.
-#
-# Background: a 30-minute `turso_stress --tx-mode concurrent` campaign hit a
-# post-run `PRAGMA integrity_check` failure roughly once in 375 runs: pages
-# allocated during the workload were never linked into any b-tree. The local
-# stress runner cannot replay a specific schedule (no --seed); Antithesis can.
-# The investigation note attached to that bug report ruled out the *failed*
-# CREATE-TABLE codepath (MVCC short-circuits page allocation in that case)
-# and pointed at the checkpoint-vs-writer interleaving instead. This scenario
-# stresses CREATE TABLE + INSERT + wal_checkpoint from many parallel drivers
-# and asserts integrity_check at every observation point.
+# Concurrent CREATE TABLE + INSERT + wal_checkpoint scenario targeting the
+# checkpoint-vs-writer interleaving inside `pager.btree_create`. No fixture
+# rows; the parallel drivers race CREATE TABLE collisions themselves.
 
 import turso
 
@@ -22,14 +14,8 @@ except Exception as e:
 
 cur = con.cursor()
 
-# No fixture rows are needed; the parallel drivers will themselves race
-# CREATE TABLE / INSERT / PRAGMA wal_checkpoint. We open the connection here
-# so the database file exists before the parallel drivers race for it.
-#
-# NOTE: Turso's Python binding only actually steps a statement when its rows
-# are fetched. `PRAGMA journal_mode = wal` returns a row (the resulting mode),
-# so we must fetch it; otherwise the pragma is silently skipped and the
-# database stays in its default journal mode, defeating the whole scenario.
+# Turso's Python binding only steps a row-returning statement when its rows
+# are fetched, so `PRAGMA journal_mode` must be fetched or it silently no-ops.
 result = cur.execute("PRAGMA journal_mode = wal")
 row = result.fetchone()
 print(f"journal_mode after setup: {row}")
