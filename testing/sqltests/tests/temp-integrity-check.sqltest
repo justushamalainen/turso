@@ -1,0 +1,45 @@
+@database :memory:
+
+# `PRAGMA <db>.integrity_check` and `PRAGMA <db>.quick_check` must walk
+# the schema of the named database, not main's.
+
+test temp-integrity-check-fresh {
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+}
+
+test temp-integrity-check-after-main-create-table {
+    CREATE TABLE t (x);
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+}
+
+test main-integrity-check-after-create-table {
+    CREATE TABLE t2 (x);
+    PRAGMA main.integrity_check;
+}
+expect {
+    ok
+}
+
+test temp-integrity-check-interleaved {
+    PRAGMA temp.integrity_check;
+    CREATE TABLE t3 (x);
+    PRAGMA temp.integrity_check;
+}
+expect {
+    ok
+    ok
+}
+
+test temp-quick-check-after-main-create-table {
+    CREATE TABLE t4 (x);
+    PRAGMA temp.quick_check;
+}
+expect {
+    ok
+}
