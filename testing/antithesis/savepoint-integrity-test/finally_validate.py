@@ -7,14 +7,8 @@
 import turso
 from antithesis.assertions import always
 
-# IMPORTANT: enable the multiprocess WAL path. Antithesis launches multiple
-# OS-level copies of `parallel_driver_*` concurrently and the default opener
-# takes an fcntl lock that rejects a second process; see core test
-# `database_open_without_experimental_multiprocess_wal_rejects_second_process`
-# in core/multiprocess_tests.rs and the plumbing at sdk-kit/src/rsapi.rs
-# (~lines 644-661). Without this, overlapping driver/validator processes hit
-# a lock at open and silently exit through the `except` below, skipping the
-# concurrent savepoint writes the scenario is meant to exercise.
+# `multiprocess_wal` is required: Antithesis runs sibling OS processes
+# concurrently and the default opener takes an fcntl lock that rejects them.
 try:
     con = turso.connect("savepoint_test.db", experimental_features="multiprocess_wal")
 except Exception as e:

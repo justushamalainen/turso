@@ -1,29 +1,14 @@
 #!/usr/bin/env -S python3 -u
 
-# Scenario: regression coverage for the concurrent SAVEPOINT / ROLLBACK TO
-# page-corruption surface described in the upstream bug report
-# "page-cell corruption under concurrent writes (overlapping cells, missing
-# index entries)".
-#
-# Local reproduction via `turso_whopper --mode ragnarok --max-connections 8`
-# hits the failure at ~14% of runs but cannot replay a specific schedule (no
-# `--seed`). Antithesis can. The bug-report-author observed that the
-# corruption signatures specifically reference `sqlite_autoindex_*_1` rows,
-# i.e. the auto-indexes created for UNIQUE columns; the seed schema below
-# defines four tables that each include both a PRIMARY KEY rowid alias *and*
-# at least one UNIQUE constraint so every parallel write moves an
-# auto-index leaf cell.
+# Concurrent SAVEPOINT / ROLLBACK TO scenario targeting the autoindex leaf
+# cells that the observed corruption signatures (`sqlite_autoindex_*_1`)
+# name. Every seed table has both a PRIMARY KEY rowid alias AND at least
+# one UNIQUE constraint so every parallel write moves an autoindex cell.
 
 import turso
 
-# IMPORTANT: enable the multiprocess WAL path. Antithesis launches multiple
-# OS-level copies of `parallel_driver_*` concurrently and the default opener
-# takes an fcntl lock that rejects a second process; see core test
-# `database_open_without_experimental_multiprocess_wal_rejects_second_process`
-# in core/multiprocess_tests.rs and the plumbing at sdk-kit/src/rsapi.rs
-# (~lines 644-661). Without this, overlapping driver/validator processes hit
-# a lock at open and silently exit through the `except` below, skipping the
-# concurrent savepoint writes the scenario is meant to exercise.
+# `multiprocess_wal` is required: Antithesis runs sibling OS processes
+# concurrently and the default opener takes an fcntl lock that rejects them.
 try:
     con = turso.connect("savepoint_test.db", experimental_features="multiprocess_wal")
 except Exception as e:

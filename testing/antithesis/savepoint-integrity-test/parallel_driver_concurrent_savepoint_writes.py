@@ -1,34 +1,15 @@
 #!/usr/bin/env -S python3 -u
 
-# Workload from `~/runs/turso-bugs/06-page-corruption-under-concurrent-writes.md`,
-# "Proposed Antithesis test case" section.
-#
-# Each invocation:
-#  - opens a connection and starts a transaction (BEGIN)
-#  - with 30% probability, opens a SAVEPOINT sp1
-#  - runs one of four DML shapes against a UNIQUE-indexed table:
-#       op 0: INSERT OR ROLLBACK INTO t0 (forces conflict on autoindex)
-#       op 1: UPDATE t1 with a randomized new value for its UNIQUE column
-#       op 2: INSERT OR IGNORE INTO t2 followed by a DELETE
-#       op 3: INSERT OR REPLACE INTO t3 (BLOB UNIQUE key)
-#  - if a savepoint was opened: ROLLBACK TO sp1 (40%) or RELEASE sp1 (60%)
-#  - COMMITs (or ROLLBACK on caught exception)
-#
-# The bug surface this targets is the autoindex-leaf-cell movement under
-# concurrent SAVEPOINT/ROLLBACK TO + DML — the corruption signatures in
-# the original report all name `sqlite_autoindex_*_1`.
+# 30% of transactions wrap their DML in SAVEPOINT/ROLLBACK TO; the four DML
+# shapes (INSERT OR ROLLBACK / UPDATE-of-UNIQUE / INSERT OR IGNORE+DELETE /
+# INSERT OR REPLACE) all move autoindex leaf cells, matching the
+# `sqlite_autoindex_*_1` corruption signatures.
 
 import turso
 from antithesis.random import get_random
 
-# IMPORTANT: enable the multiprocess WAL path. Antithesis launches multiple
-# OS-level copies of `parallel_driver_*` concurrently and the default opener
-# takes an fcntl lock that rejects a second process; see core test
-# `database_open_without_experimental_multiprocess_wal_rejects_second_process`
-# in core/multiprocess_tests.rs and the plumbing at sdk-kit/src/rsapi.rs
-# (~lines 644-661). Without this, overlapping driver/validator processes hit
-# a lock at open and silently exit through the `except` below, skipping the
-# concurrent savepoint writes the scenario is meant to exercise.
+# `multiprocess_wal` is required: Antithesis runs sibling OS processes
+# concurrently and the default opener takes an fcntl lock that rejects them.
 try:
     con = turso.connect("savepoint_test.db", experimental_features="multiprocess_wal")
 except Exception as e:
